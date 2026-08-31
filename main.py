@@ -1,13 +1,13 @@
 # ============================================================
 # MEDICAL REPRESENTATIVE MANAGEMENT BOT
 # Python + Telegram + PostgreSQL
-# نسخة أولية متكاملة وقابلة للتوسع
+# نسخة مفعلة بالكامل + Excel Export
 # ============================================================
 
 import os
 import logging
 from datetime import datetime, date, timedelta
-from enum import Enum
+from io import BytesIO
 
 from dotenv import load_dotenv
 
@@ -25,6 +25,7 @@ from sqlalchemy import (
     ForeignKey,
     UniqueConstraint,
     func,
+    or_,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -32,12 +33,13 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 
 from telegram.ext import (
@@ -57,12 +59,16 @@ from telegram.ext import (
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://postgres:postgres@localhost:5432/medical_rep_bot"
 )
 
-COMPANY_NAME = os.getenv("COMPANY_NAME", "الشركة الدوائية")
+COMPANY_NAME = os.getenv(
+    "COMPANY_NAME",
+    "الشركة الدوائية"
+)
 
 ADMIN_IDS_TEXT = os.getenv("ADMIN_IDS", "")
 
@@ -74,36 +80,10 @@ for value in ADMIN_IDS_TEXT.split(","):
     if value.isdigit():
         ADMIN_IDS.append(int(value))
 
-
 if not BOT_TOKEN:
     raise ValueError(
-        "BOT_TOKEN غير موجود. "
-        "قم بإضافته في متغيرات البيئة."
+        "BOT_TOKEN غير موجود في متغيرات البيئة."
     )
-
-
-# ============================================================
-# السجل
-# ============================================================
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-
-logger = logging.getLogger(__name__)
-
-
-# ============================================================
-# قاعدة البيانات
-# ============================================================
-
-Base = declarative_base()
-
-import os
-from sqlalchemy import create_engine
-
-DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError(
@@ -117,13 +97,28 @@ if DATABASE_URL.startswith("postgres://"):
         1
     )
 
+# ============================================================
+# Logging
+# ============================================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Database
+# ============================================================
+
+Base = declarative_base()
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     future=True
 )
-
-from sqlalchemy.orm import sessionmaker
 
 SessionLocal = sessionmaker(
     autocommit=False,
@@ -132,7 +127,7 @@ SessionLocal = sessionmaker(
 )
 
 # ============================================================
-# الثوابت
+# Roles
 # ============================================================
 
 ROLE_ADMIN = "admin"
@@ -142,25 +137,24 @@ ROLE_WAREHOUSE = "warehouse"
 ROLE_PHARMACY_OWNER = "pharmacy_owner"
 ROLE_PHARMACIST = "pharmacist"
 
+# ============================================================
+# Doctor categories
+# ============================================================
 
 DOCTOR_CATEGORY_A = "A"
 DOCTOR_CATEGORY_B = "B"
 DOCTOR_CATEGORY_C = "C"
 DOCTOR_CATEGORY_D = "D"
 
-
 # ============================================================
-# جداول المستخدمين
+# USERS
 # ============================================================
 
 class User(Base):
 
     __tablename__ = "users"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     telegram_id = Column(
         BigInteger,
@@ -169,20 +163,11 @@ class User(Base):
         index=True
     )
 
-    full_name = Column(
-        String(255),
-        nullable=True
-    )
+    full_name = Column(String(255), nullable=True)
 
-    username = Column(
-        String(255),
-        nullable=True
-    )
+    username = Column(String(255), nullable=True)
 
-    phone = Column(
-        String(50),
-        nullable=True
-    )
+    phone = Column(String(50), nullable=True)
 
     role = Column(
         String(50),
@@ -207,17 +192,14 @@ class User(Base):
 
 
 # ============================================================
-# التخصصات
+# SPECIALTIES
 # ============================================================
 
 class Specialty(Base):
 
     __tablename__ = "specialties"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     name = Column(
         String(255),
@@ -232,17 +214,14 @@ class Specialty(Base):
 
 
 # ============================================================
-# المستشفيات
+# HOSPITALS
 # ============================================================
 
 class Hospital(Base):
 
     __tablename__ = "hospitals"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     name = Column(
         String(255),
@@ -292,17 +271,14 @@ class Hospital(Base):
 
 
 # ============================================================
-# العيادات
+# CLINICS
 # ============================================================
 
 class Clinic(Base):
 
     __tablename__ = "clinics"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     name = Column(
         String(255),
@@ -336,17 +312,14 @@ class Clinic(Base):
 
 
 # ============================================================
-# الأطباء
+# DOCTORS
 # ============================================================
 
 class Doctor(Base):
 
     __tablename__ = "doctors"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     full_name = Column(
         String(255),
@@ -456,17 +429,14 @@ class Doctor(Base):
 
 
 # ============================================================
-# ربط الطبيب بالمستشفى
+# DOCTOR HOSPITAL
 # ============================================================
 
 class DoctorHospital(Base):
 
     __tablename__ = "doctor_hospitals"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     doctor_id = Column(
         Integer,
@@ -499,17 +469,14 @@ class DoctorHospital(Base):
 
 
 # ============================================================
-# ربط الطبيب بالعيادة
+# DOCTOR CLINIC
 # ============================================================
 
 class DoctorClinic(Base):
 
     __tablename__ = "doctor_clinics"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     doctor_id = Column(
         Integer,
@@ -529,17 +496,14 @@ class DoctorClinic(Base):
 
 
 # ============================================================
-# الصيدليات
+# PHARMACIES
 # ============================================================
 
 class Pharmacy(Base):
 
     __tablename__ = "pharmacies"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     name = Column(
         String(255),
@@ -630,17 +594,14 @@ class Pharmacy(Base):
 
 
 # ============================================================
-# ربط المستخدم بالصيدلية
+# USER PHARMACY
 # ============================================================
 
 class UserPharmacy(Base):
 
     __tablename__ = "user_pharmacies"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     user_id = Column(
         Integer,
@@ -668,17 +629,14 @@ class UserPharmacy(Base):
 
 
 # ============================================================
-# الصيادلة
+# PHARMACISTS
 # ============================================================
 
 class Pharmacist(Base):
 
     __tablename__ = "pharmacists"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     full_name = Column(
         String(255),
@@ -710,17 +668,14 @@ class Pharmacist(Base):
 
 
 # ============================================================
-# المنتجات
+# PRODUCTS
 # ============================================================
 
 class Product(Base):
 
     __tablename__ = "products"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     code = Column(
         String(100),
@@ -813,17 +768,14 @@ class Product(Base):
 
 
 # ============================================================
-# ربط المنتجات بالتخصصات
+# PRODUCT SPECIALTY
 # ============================================================
 
 class ProductSpecialty(Base):
 
     __tablename__ = "product_specialties"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     product_id = Column(
         Integer,
@@ -843,17 +795,14 @@ class ProductSpecialty(Base):
 
 
 # ============================================================
-# التشغيلات
+# BATCHES
 # ============================================================
 
 class Batch(Base):
 
     __tablename__ = "batches"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     product_id = Column(
         Integer,
@@ -890,17 +839,14 @@ class Batch(Base):
 
 
 # ============================================================
-# المخازن
+# WAREHOUSES
 # ============================================================
 
 class Warehouse(Base):
 
     __tablename__ = "warehouses"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     name = Column(
         String(255),
@@ -939,17 +885,14 @@ class Warehouse(Base):
 
 
 # ============================================================
-# مخزون المخازن
+# WAREHOUSE STOCK
 # ============================================================
 
 class WarehouseStock(Base):
 
     __tablename__ = "warehouse_stock"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     warehouse_id = Column(
         Integer,
@@ -1002,17 +945,14 @@ class WarehouseStock(Base):
 
 
 # ============================================================
-# مخزون الصيدليات
+# PHARMACY STOCK
 # ============================================================
 
 class PharmacyStock(Base):
 
     __tablename__ = "pharmacy_stock"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     pharmacy_id = Column(
         Integer,
@@ -1067,17 +1007,14 @@ class PharmacyStock(Base):
 
 
 # ============================================================
-# حركات المخزون
+# STOCK MOVEMENTS
 # ============================================================
 
 class StockMovement(Base):
 
     __tablename__ = "stock_movements"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     location_type = Column(
         String(50),
@@ -1139,17 +1076,14 @@ class StockMovement(Base):
 
 
 # ============================================================
-# زيارات الأطباء
+# DOCTOR VISITS
 # ============================================================
 
 class DoctorVisit(Base):
 
     __tablename__ = "doctor_visits"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     doctor_id = Column(
         Integer,
@@ -1189,17 +1123,14 @@ class DoctorVisit(Base):
 
 
 # ============================================================
-# منتجات زيارة الطبيب
+# DOCTOR VISIT PRODUCTS
 # ============================================================
 
 class DoctorVisitProduct(Base):
 
     __tablename__ = "doctor_visit_products"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     visit_id = Column(
         Integer,
@@ -1220,17 +1151,14 @@ class DoctorVisitProduct(Base):
 
 
 # ============================================================
-# زيارات الصيدليات
+# PHARMACY VISITS
 # ============================================================
 
 class PharmacyVisit(Base):
 
     __tablename__ = "pharmacy_visits"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     pharmacy_id = Column(
         Integer,
@@ -1261,17 +1189,14 @@ class PharmacyVisit(Base):
 
 
 # ============================================================
-# طلب زيارة
+# VISIT REQUESTS
 # ============================================================
 
 class VisitRequest(Base):
 
     __tablename__ = "visit_requests"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     pharmacy_id = Column(
         Integer,
@@ -1302,17 +1227,14 @@ class VisitRequest(Base):
 
 
 # ============================================================
-# التذكيرات
+# REMINDERS
 # ============================================================
 
 class Reminder(Base):
 
     __tablename__ = "reminders"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     user_id = Column(
         Integer,
@@ -1342,17 +1264,14 @@ class Reminder(Base):
 
 
 # ============================================================
-# سجل العمليات
+# AUDIT LOG
 # ============================================================
 
 class AuditLog(Base):
 
     __tablename__ = "audit_logs"
 
-    id = Column(
-        Integer,
-        primary_key=True
-    )
+    id = Column(Integer, primary_key=True)
 
     user_id = Column(
         Integer,
@@ -1392,7 +1311,7 @@ class AuditLog(Base):
 
 
 # ============================================================
-# إنشاء الجداول
+# DATABASE INIT
 # ============================================================
 
 def initialize_database():
@@ -1403,7 +1322,7 @@ def initialize_database():
 
 
 # ============================================================
-# أدوات المستخدم
+# USER
 # ============================================================
 
 def get_or_create_user(update: Update):
@@ -1436,13 +1355,21 @@ def get_or_create_user(update: Update):
             )
 
             db.add(user)
+
             db.commit()
+
             db.refresh(user)
 
         else:
 
             user.full_name = telegram_user.full_name
             user.username = telegram_user.username
+
+            if (
+                telegram_user.id in ADMIN_IDS
+                and user.role != ROLE_ADMIN
+            ):
+                user.role = ROLE_ADMIN
 
             db.commit()
 
@@ -1460,14 +1387,40 @@ def get_or_create_user(update: Update):
 
 def is_admin(user_data):
 
-    if not user_data:
-        return False
-
-    return user_data["role"] == ROLE_ADMIN
+    return bool(
+        user_data
+        and user_data["role"] == ROLE_ADMIN
+    )
 
 
 # ============================================================
-# لوحة المدير
+# AUDIT
+# ============================================================
+
+def add_audit_log(
+    db,
+    user_id,
+    action,
+    entity_type=None,
+    entity_id=None,
+    old_value=None,
+    new_value=None
+):
+
+    db.add(
+        AuditLog(
+            user_id=user_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            old_value=old_value,
+            new_value=new_value
+        )
+    )
+
+
+# ============================================================
+# ADMIN KEYBOARD
 # ============================================================
 
 def admin_keyboard():
@@ -1479,11 +1432,21 @@ def admin_keyboard():
                 "👨‍⚕️ الأطباء",
                 callback_data="admin_doctors"
             ),
+            InlineKeyboardButton(
+                "➕ إضافة طبيب",
+                callback_data="add_doctor"
+            )
+        ],
 
+        [
             InlineKeyboardButton(
                 "🏪 الصيدليات",
                 callback_data="admin_pharmacies"
             ),
+            InlineKeyboardButton(
+                "➕ إضافة صيدلية",
+                callback_data="add_pharmacy"
+            )
         ],
 
         [
@@ -1491,23 +1454,32 @@ def admin_keyboard():
                 "💊 المنتجات",
                 callback_data="admin_products"
             ),
-
             InlineKeyboardButton(
-                "📦 المخازن",
-                callback_data="admin_warehouses"
-            ),
+                "➕ إضافة منتج",
+                callback_data="add_product"
+            )
         ],
 
         [
             InlineKeyboardButton(
+                "🧑‍🔬 الصيادلة",
+                callback_data="admin_pharmacists"
+            ),
+            InlineKeyboardButton(
                 "🏥 المستشفيات",
                 callback_data="admin_hospitals"
-            ),
+            )
+        ],
 
+        [
             InlineKeyboardButton(
-                "👨‍🔬 المستخدمون",
-                callback_data="admin_users"
+                "📦 المخازن",
+                callback_data="admin_warehouses"
             ),
+            InlineKeyboardButton(
+                "👨‍💼 المستخدمون",
+                callback_data="admin_users"
+            )
         ],
 
         [
@@ -1515,23 +1487,28 @@ def admin_keyboard():
                 "📊 التقارير",
                 callback_data="admin_reports"
             ),
-
             InlineKeyboardButton(
-                "⚠️ التنبيهات",
-                callback_data="admin_alerts"
-            ),
+                "📈 الإحصائيات",
+                callback_data="dashboard"
+            )
         ],
 
         [
             InlineKeyboardButton(
+                "⚠️ التنبيهات",
+                callback_data="admin_alerts"
+            ),
+            InlineKeyboardButton(
                 "🔎 البحث",
                 callback_data="search"
-            ),
+            )
+        ],
 
+        [
             InlineKeyboardButton(
-                "📈 لوحة الإحصائيات",
-                callback_data="dashboard"
-            ),
+                "📥 تصدير Excel",
+                callback_data="export_excel"
+            )
         ],
 
     ]
@@ -1540,7 +1517,7 @@ def admin_keyboard():
 
 
 # ============================================================
-# لوحة المندوب
+# REPRESENTATIVE KEYBOARD
 # ============================================================
 
 def representative_keyboard():
@@ -1552,11 +1529,10 @@ def representative_keyboard():
                 "👨‍⚕️ الأطباء",
                 callback_data="rep_doctors"
             ),
-
             InlineKeyboardButton(
                 "🏪 الصيدليات",
                 callback_data="rep_pharmacies"
-            ),
+            )
         ],
 
         [
@@ -1564,11 +1540,10 @@ def representative_keyboard():
                 "🗓️ زيارات اليوم",
                 callback_data="today_visits"
             ),
-
             InlineKeyboardButton(
                 "➕ تسجيل زيارة",
                 callback_data="add_visit"
-            ),
+            )
         ],
 
         [
@@ -1576,18 +1551,24 @@ def representative_keyboard():
                 "💊 المنتجات",
                 callback_data="products_list"
             ),
-
             InlineKeyboardButton(
                 "🔎 البحث",
                 callback_data="search"
-            ),
+            )
         ],
 
         [
             InlineKeyboardButton(
                 "🔔 التذكيرات",
                 callback_data="my_reminders"
-            ),
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📥 تصدير بياناتي Excel",
+                callback_data="export_excel"
+            )
         ]
 
     ]
@@ -1596,7 +1577,7 @@ def representative_keyboard():
 
 
 # ============================================================
-# لوحة صاحب الصيدلية
+# PHARMACY OWNER
 # ============================================================
 
 def pharmacy_owner_keyboard():
@@ -1615,11 +1596,10 @@ def pharmacy_owner_keyboard():
                 "📦 مخزوني",
                 callback_data="pharmacy_inventory"
             ),
-
             InlineKeyboardButton(
                 "➕ إضافة صنف",
                 callback_data="pharmacy_add_stock"
-            ),
+            )
         ],
 
         [
@@ -1627,11 +1607,10 @@ def pharmacy_owner_keyboard():
                 "✏️ تحديث كمية",
                 callback_data="pharmacy_update_stock"
             ),
-
             InlineKeyboardButton(
                 "📋 قائمة الأصناف",
                 callback_data="pharmacy_products"
-            ),
+            )
         ],
 
         [
@@ -1639,11 +1618,10 @@ def pharmacy_owner_keyboard():
                 "⚠️ مخزون منخفض",
                 callback_data="pharmacy_low_stock"
             ),
-
             InlineKeyboardButton(
                 "⏳ قرب الانتهاء",
                 callback_data="pharmacy_expiry"
-            ),
+            )
         ],
 
         [
@@ -1651,11 +1629,17 @@ def pharmacy_owner_keyboard():
                 "🗓️ طلب زيارة مندوب",
                 callback_data="request_visit"
             ),
-
             InlineKeyboardButton(
                 "💬 إرسال ملاحظة",
                 callback_data="pharmacy_note"
-            ),
+            )
+        ],
+
+        [
+            InlineKeyboardButton(
+                "📥 تصدير مخزوني Excel",
+                callback_data="export_excel"
+            )
         ]
 
     ]
@@ -1664,7 +1648,7 @@ def pharmacy_owner_keyboard():
 
 
 # ============================================================
-# لوحة حسب الصلاحية
+# MAIN KEYBOARD
 # ============================================================
 
 def get_main_keyboard(user):
@@ -1682,7 +1666,7 @@ def get_main_keyboard(user):
 
 
 # ============================================================
-# حالة المحادثات
+# STATES
 # ============================================================
 
 (
@@ -1726,8 +1710,10 @@ async def start(
 
     text = (
         f"🩺 أهلاً بك في نظام {COMPANY_NAME}\n\n"
-        "نظام إدارة المندوبين العلميين "
-        "والأطباء والصيدليات والمخزون."
+        "نظام إدارة الشركة الدوائية\n"
+        "والأطباء والصيدليات والصيادلة والمنتجات "
+        "والمخزون والزيارات والتقارير.\n\n"
+        "اختر الخدمة من القائمة:"
     )
 
     await update.message.reply_text(
@@ -1737,7 +1723,7 @@ async def start(
 
 
 # ============================================================
-# لوحة الإحصائيات
+# DASHBOARD
 # ============================================================
 
 async def dashboard_callback(
@@ -1753,47 +1739,64 @@ async def dashboard_callback(
 
     try:
 
-        doctors_count = db.query(
+        doctors = db.query(
             func.count(Doctor.id)
         ).scalar() or 0
 
-        pharmacies_count = db.query(
+        pharmacies = db.query(
             func.count(Pharmacy.id)
         ).scalar() or 0
 
-        pharmacists_count = db.query(
+        pharmacists = db.query(
             func.count(Pharmacist.id)
         ).scalar() or 0
 
-        products_count = db.query(
+        products = db.query(
             func.count(Product.id)
         ).scalar() or 0
 
-        batches_count = db.query(
+        batches = db.query(
             func.count(Batch.id)
         ).scalar() or 0
 
-        hospitals_count = db.query(
+        hospitals = db.query(
             func.count(Hospital.id)
+        ).scalar() or 0
+
+        warehouses = db.query(
+            func.count(Warehouse.id)
+        ).scalar() or 0
+
+        users = db.query(
+            func.count(User.id)
         ).scalar() or 0
 
         today = date.today()
 
-        visits_today = db.query(
+        doctor_visits = db.query(
             func.count(DoctorVisit.id)
         ).filter(
             DoctorVisit.visit_date == today
         ).scalar() or 0
 
+        pharmacy_visits = db.query(
+            func.count(PharmacyVisit.id)
+        ).filter(
+            PharmacyVisit.visit_date == today
+        ).scalar() or 0
+
         text = (
-            "📈 لوحة التحكم\n\n"
-            f"👨‍⚕️ الأطباء: {doctors_count}\n"
-            f"🏪 الصيدليات: {pharmacies_count}\n"
-            f"💊 الصيادلة: {pharmacists_count}\n"
-            f"💊 المنتجات: {products_count}\n"
-            f"🧪 التشغيلات: {batches_count}\n"
-            f"🏥 المستشفيات: {hospitals_count}\n"
-            f"🗓️ زيارات اليوم: {visits_today}"
+            "📈 لوحة الإحصائيات\n\n"
+            f"👨‍⚕️ الأطباء: {doctors}\n"
+            f"🏪 الصيدليات: {pharmacies}\n"
+            f"🧑‍🔬 الصيادلة: {pharmacists}\n"
+            f"💊 المنتجات: {products}\n"
+            f"🧪 التشغيلات: {batches}\n"
+            f"🏥 المستشفيات: {hospitals}\n"
+            f"📦 المخازن: {warehouses}\n"
+            f"👨‍💼 المستخدمون: {users}\n\n"
+            f"🗓️ زيارات الأطباء اليوم: {doctor_visits}\n"
+            f"🏪 زيارات الصيدليات اليوم: {pharmacy_visits}"
         )
 
         await query.message.reply_text(text)
@@ -1804,7 +1807,428 @@ async def dashboard_callback(
 
 
 # ============================================================
-# إضافة طبيب
+# DOCTORS LIST
+# ============================================================
+
+async def doctors_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        doctors = db.query(
+            Doctor
+        ).order_by(
+            Doctor.full_name
+        ).limit(100).all()
+
+        if not doctors:
+
+            await query.message.reply_text(
+                "لا يوجد أطباء مسجلون.\n\n"
+                "استخدم زر «إضافة طبيب» لإضافة طبيب جديد."
+            )
+
+            return
+
+        text = "👨‍⚕️ قائمة الأطباء:\n\n"
+
+        for doctor in doctors:
+
+            specialty = "-"
+
+            if doctor.specialty:
+                specialty = doctor.specialty.name
+
+            text += (
+                f"🆔 {doctor.id}\n"
+                f"👨‍⚕️ {doctor.full_name}\n"
+                f"🩺 {specialty}\n"
+                f"⭐ {doctor.category}\n"
+                f"📞 {doctor.phone or '-'}\n"
+                f"📍 {doctor.city or '-'}\n\n"
+            )
+
+            if len(text) >= 3500:
+
+                await query.message.reply_text(text)
+
+                text = ""
+
+        if text:
+            await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# PHARMACIES LIST
+# ============================================================
+
+async def pharmacies_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        pharmacies = db.query(
+            Pharmacy
+        ).order_by(
+            Pharmacy.name
+        ).limit(100).all()
+
+        if not pharmacies:
+
+            await query.message.reply_text(
+                "لا توجد صيدليات مسجلة.\n\n"
+                "استخدم زر «إضافة صيدلية» لإضافة صيدلية."
+            )
+
+            return
+
+        text = "🏪 قائمة الصيدليات:\n\n"
+
+        for pharmacy in pharmacies:
+
+            text += (
+                f"🆔 {pharmacy.id}\n"
+                f"🏪 {pharmacy.name}\n"
+                f"👤 {pharmacy.owner_name or '-'}\n"
+                f"📞 {pharmacy.phone or '-'}\n"
+                f"📍 {pharmacy.city or '-'}\n"
+                f"⭐ {pharmacy.classification or '-'}\n\n"
+            )
+
+            if len(text) >= 3500:
+
+                await query.message.reply_text(text)
+
+                text = ""
+
+        if text:
+            await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# PHARMACISTS
+# ============================================================
+
+async def pharmacists_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        pharmacists = db.query(
+            Pharmacist
+        ).order_by(
+            Pharmacist.full_name
+        ).limit(100).all()
+
+        if not pharmacists:
+
+            await query.message.reply_text(
+                "لا يوجد صيادلة مسجلون حالياً."
+            )
+
+            return
+
+        text = "🧑‍🔬 قائمة الصيادلة:\n\n"
+
+        for pharmacist in pharmacists:
+
+            pharmacy_name = "-"
+
+            if pharmacist.pharmacy:
+                pharmacy_name = pharmacist.pharmacy.name
+
+            text += (
+                f"🆔 {pharmacist.id}\n"
+                f"🧑‍🔬 {pharmacist.full_name}\n"
+                f"📞 {pharmacist.phone or '-'}\n"
+                f"🏪 {pharmacy_name}\n"
+                f"⭐ {pharmacist.classification or '-'}\n\n"
+            )
+
+        await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# HOSPITALS
+# ============================================================
+
+async def hospitals_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        hospitals = db.query(
+            Hospital
+        ).order_by(
+            Hospital.name
+        ).limit(100).all()
+
+        if not hospitals:
+
+            await query.message.reply_text(
+                "لا توجد مستشفيات مسجلة حالياً."
+            )
+
+            return
+
+        text = "🏥 المستشفيات:\n\n"
+
+        for hospital in hospitals:
+
+            text += (
+                f"🆔 {hospital.id}\n"
+                f"🏥 {hospital.name}\n"
+                f"📍 {hospital.city or '-'}\n"
+                f"📞 {hospital.phone or '-'}\n"
+                f"🏷️ {hospital.hospital_type or '-'}\n\n"
+            )
+
+        await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# WAREHOUSES
+# ============================================================
+
+async def warehouses_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        warehouses = db.query(
+            Warehouse
+        ).order_by(
+            Warehouse.name
+        ).all()
+
+        if not warehouses:
+
+            await query.message.reply_text(
+                "لا توجد مخازن مسجلة حالياً."
+            )
+
+            return
+
+        text = "📦 المخازن:\n\n"
+
+        for warehouse in warehouses:
+
+            stock_count = db.query(
+                func.coalesce(
+                    func.sum(
+                        WarehouseStock.quantity
+                    ),
+                    0
+                )
+            ).filter(
+                WarehouseStock.warehouse_id ==
+                warehouse.id
+            ).scalar() or 0
+
+            text += (
+                f"🆔 {warehouse.id}\n"
+                f"📦 {warehouse.name}\n"
+                f"📍 {warehouse.city or '-'}\n"
+                f"👤 {warehouse.manager_name or '-'}\n"
+                f"📞 {warehouse.phone or '-'}\n"
+                f"🔢 إجمالي الكميات: {stock_count}\n\n"
+            )
+
+        await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+async def users_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_data = get_or_create_user(update)
+
+    if not is_admin(user_data):
+
+        await query.message.reply_text(
+            "❌ هذه الصفحة للمدير فقط."
+        )
+
+        return
+
+    db = SessionLocal()
+
+    try:
+
+        users = db.query(
+            User
+        ).order_by(
+            User.full_name
+        ).all()
+
+        if not users:
+
+            await query.message.reply_text(
+                "لا يوجد مستخدمون."
+            )
+
+            return
+
+        text = "👨‍💼 المستخدمون:\n\n"
+
+        for user in users:
+
+            text += (
+                f"🆔 {user.id}\n"
+                f"👤 {user.full_name or '-'}\n"
+                f"📱 @{user.username or '-'}\n"
+                f"🔑 {user.role}\n"
+                f"📞 {user.phone or '-'}\n"
+                f"🟢 {'فعال' if user.is_active else 'غير فعال'}\n\n"
+            )
+
+            if len(text) >= 3500:
+
+                await query.message.reply_text(text)
+
+                text = ""
+
+        if text:
+            await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# PRODUCTS
+# ============================================================
+
+async def products_list_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    db = SessionLocal()
+
+    try:
+
+        products = db.query(
+            Product
+        ).filter(
+            Product.is_active == True
+        ).order_by(
+            Product.brand_name
+        ).limit(200).all()
+
+        if not products:
+
+            await query.message.reply_text(
+                "لا توجد منتجات حالياً.\n\n"
+                "استخدم زر «إضافة منتج» لإضافة منتج."
+            )
+
+            return
+
+        text = "💊 قائمة المنتجات:\n\n"
+
+        for product in products:
+
+            text += (
+                f"🆔 {product.id}\n"
+                f"🔢 الكود: {product.code}\n"
+                f"💊 {product.brand_name}\n"
+                f"🔬 {product.scientific_name or '-'}\n"
+                f"⚗️ {product.concentration or '-'}\n"
+                f"💉 {product.dosage_form or '-'}\n"
+                f"🏭 {product.manufacturer or '-'}\n\n"
+            )
+
+            if len(text) >= 3500:
+
+                await query.message.reply_text(text)
+
+                text = ""
+
+        if text:
+            await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# ADD DOCTOR
 # ============================================================
 
 async def add_doctor_start(
@@ -1815,6 +2239,11 @@ async def add_doctor_start(
     query = update.callback_query
 
     await query.answer()
+
+    user_data = get_or_create_user(update)
+
+    if not user_data:
+        return ConversationHandler.END
 
     await query.message.reply_text(
         "👨‍⚕️ أدخل الاسم الكامل للطبيب:"
@@ -1848,33 +2277,10 @@ async def add_doctor_phone(
         update.message.text.strip()
     )
 
-    db = SessionLocal()
-
-    try:
-
-        specialties = db.query(
-            Specialty
-        ).limit(20).all()
-
-        if specialties:
-
-            text = "🩺 أدخل اسم تخصص الطبيب:\n\n"
-
-            for specialty in specialties:
-                text += f"• {specialty.name}\n"
-
-        else:
-
-            text = (
-                "🩺 أدخل تخصص الطبيب.\n"
-                "مثال: أطفال"
-            )
-
-        await update.message.reply_text(text)
-
-    finally:
-
-        db.close()
+    await update.message.reply_text(
+        "🩺 أدخل تخصص الطبيب:\n\n"
+        "مثال: أطفال"
+    )
 
     return ADD_DOCTOR_SPECIALTY
 
@@ -1884,7 +2290,7 @@ async def add_doctor_specialty(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    specialty_name = update.message.text.strip()
+    name = update.message.text.strip()
 
     db = SessionLocal()
 
@@ -1893,22 +2299,22 @@ async def add_doctor_specialty(
         specialty = db.query(
             Specialty
         ).filter(
-            Specialty.name == specialty_name
+            Specialty.name == name
         ).first()
 
         if not specialty:
 
-            specialty = Specialty(
-                name=specialty_name
-            )
+            specialty = Specialty(name=name)
 
             db.add(specialty)
+
             db.commit()
+
             db.refresh(specialty)
 
-        context.user_data["specialty_id"] = (
-            specialty.id
-        )
+        context.user_data[
+            "specialty_id"
+        ] = specialty.id
 
     finally:
 
@@ -1916,7 +2322,7 @@ async def add_doctor_specialty(
 
     await update.message.reply_text(
         "⭐ اختر تصنيف الطبيب:\n"
-        "A / B / C / D"
+        "A أو B أو C أو D"
     )
 
     return ADD_DOCTOR_CATEGORY
@@ -1931,16 +2337,22 @@ async def add_doctor_category(
         update.message.text.strip().upper()
     )
 
-    if category not in ["A", "B", "C", "D"]:
+    if category not in [
+        "A",
+        "B",
+        "C",
+        "D"
+    ]:
 
         await update.message.reply_text(
-            "❌ التصنيف غير صحيح.\n"
-            "أدخل A أو B أو C أو D."
+            "❌ أدخل A أو B أو C أو D."
         )
 
         return ADD_DOCTOR_CATEGORY
 
-    context.user_data["doctor_category"] = category
+    context.user_data[
+        "doctor_category"
+    ] = category
 
     await update.message.reply_text(
         "📍 أدخل المدينة أو المنطقة:"
@@ -1963,27 +2375,20 @@ async def add_doctor_city(
     try:
 
         doctor = Doctor(
-
             full_name=context.user_data.get(
                 "doctor_name"
             ),
-
             phone=context.user_data.get(
                 "doctor_phone"
             ),
-
             specialty_id=context.user_data.get(
                 "specialty_id"
             ),
-
             category=context.user_data.get(
                 "doctor_category"
             ),
-
             city=city,
-
             assigned_rep_id=user_data["id"]
-
         )
 
         db.add(doctor)
@@ -1993,20 +2398,30 @@ async def add_doctor_city(
         db.refresh(doctor)
 
         add_audit_log(
-            db=db,
-            user_id=user_data["id"],
-            action="إضافة طبيب",
-            entity_type="doctor",
-            entity_id=doctor.id
+            db,
+            user_data["id"],
+            "إضافة طبيب",
+            "doctor",
+            doctor.id
         )
 
         db.commit()
 
         await update.message.reply_text(
-            f"✅ تم إضافة الطبيب بنجاح.\n\n"
-            f"👨‍⚕️ الاسم: {doctor.full_name}\n"
-            f"🆔 الرقم: {doctor.id}\n"
-            f"⭐ التصنيف: {doctor.category}"
+            "✅ تم إضافة الطبيب بنجاح.\n\n"
+            f"👨‍⚕️ {doctor.full_name}\n"
+            f"🆔 {doctor.id}\n"
+            f"⭐ {doctor.category}"
+        )
+
+    except Exception as error:
+
+        db.rollback()
+
+        logger.exception(error)
+
+        await update.message.reply_text(
+            "❌ حدث خطأ أثناء إضافة الطبيب."
         )
 
     finally:
@@ -2019,7 +2434,7 @@ async def add_doctor_city(
 
 
 # ============================================================
-# إضافة صيدلية
+# ADD PHARMACY
 # ============================================================
 
 async def add_pharmacy_start(
@@ -2043,9 +2458,9 @@ async def add_pharmacy_name(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["pharmacy_name"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "pharmacy_name"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
         "👤 أدخل اسم صاحب الصيدلية:"
@@ -2059,9 +2474,9 @@ async def add_pharmacy_owner(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["pharmacy_owner"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "pharmacy_owner"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
         "📞 أدخل رقم الهاتف:"
@@ -2075,9 +2490,9 @@ async def add_pharmacy_phone(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["pharmacy_phone"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "pharmacy_phone"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
         "📍 أدخل المدينة:"
@@ -2098,23 +2513,17 @@ async def add_pharmacy_city(
     try:
 
         pharmacy = Pharmacy(
-
             name=context.user_data.get(
                 "pharmacy_name"
             ),
-
             owner_name=context.user_data.get(
                 "pharmacy_owner"
             ),
-
             phone=context.user_data.get(
                 "pharmacy_phone"
             ),
-
             city=update.message.text.strip(),
-
             assigned_rep_id=user_data["id"]
-
         )
 
         db.add(pharmacy)
@@ -2124,19 +2533,29 @@ async def add_pharmacy_city(
         db.refresh(pharmacy)
 
         add_audit_log(
-            db=db,
-            user_id=user_data["id"],
-            action="إضافة صيدلية",
-            entity_type="pharmacy",
-            entity_id=pharmacy.id
+            db,
+            user_data["id"],
+            "إضافة صيدلية",
+            "pharmacy",
+            pharmacy.id
         )
 
         db.commit()
 
         await update.message.reply_text(
-            f"✅ تم إضافة الصيدلية بنجاح.\n\n"
+            "✅ تم إضافة الصيدلية بنجاح.\n\n"
             f"🏪 {pharmacy.name}\n"
-            f"🆔 رقم الصيدلية: {pharmacy.id}"
+            f"🆔 {pharmacy.id}"
+        )
+
+    except Exception as error:
+
+        db.rollback()
+
+        logger.exception(error)
+
+        await update.message.reply_text(
+            "❌ حدث خطأ أثناء إضافة الصيدلية."
         )
 
     finally:
@@ -2149,7 +2568,7 @@ async def add_pharmacy_city(
 
 
 # ============================================================
-# إضافة منتج
+# ADD PRODUCT
 # ============================================================
 
 async def add_product_start(
@@ -2173,9 +2592,9 @@ async def add_product_code(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["product_code"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "product_code"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
         "💊 أدخل الاسم التجاري:"
@@ -2189,9 +2608,9 @@ async def add_product_name(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["product_name"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "product_name"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
         "🔬 أدخل الاسم العلمي أو المادة الفعالة:"
@@ -2205,12 +2624,12 @@ async def add_product_scientific(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["product_scientific"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "product_scientific"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
-        "⚗️ أدخل التركيز.\nمثال: 500mg"
+        "⚗️ أدخل التركيز:"
     )
 
     return ADD_PRODUCT_CONCENTRATION
@@ -2221,13 +2640,12 @@ async def add_product_concentration(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    context.user_data["product_concentration"] = (
-        update.message.text.strip()
-    )
+    context.user_data[
+        "product_concentration"
+    ] = update.message.text.strip()
 
     await update.message.reply_text(
-        "💉 أدخل الشكل الدوائي.\n"
-        "مثال: أقراص / شراب / حقن"
+        "💉 أدخل الشكل الدوائي:"
     )
 
     return ADD_PRODUCT_FORM
@@ -2244,11 +2662,14 @@ async def add_product_form(
 
     try:
 
-        existing = db.query(Product).filter(
-            Product.code ==
-            context.user_data.get(
-                "product_code"
-            )
+        code = context.user_data.get(
+            "product_code"
+        )
+
+        existing = db.query(
+            Product
+        ).filter(
+            Product.code == code
         ).first()
 
         if existing:
@@ -2260,29 +2681,20 @@ async def add_product_form(
             return ConversationHandler.END
 
         product = Product(
-
-            code=context.user_data.get(
-                "product_code"
-            ),
-
+            code=code,
             brand_name=context.user_data.get(
                 "product_name"
             ),
-
             scientific_name=context.user_data.get(
                 "product_scientific"
             ),
-
             active_ingredient=context.user_data.get(
                 "product_scientific"
             ),
-
             concentration=context.user_data.get(
                 "product_concentration"
             ),
-
             dosage_form=update.message.text.strip()
-
         )
 
         db.add(product)
@@ -2292,20 +2704,30 @@ async def add_product_form(
         db.refresh(product)
 
         add_audit_log(
-            db=db,
-            user_id=user_data["id"],
-            action="إضافة منتج",
-            entity_type="product",
-            entity_id=product.id
+            db,
+            user_data["id"],
+            "إضافة منتج",
+            "product",
+            product.id
         )
 
         db.commit()
 
         await update.message.reply_text(
-            f"✅ تم إضافة المنتج.\n\n"
+            "✅ تم إضافة المنتج.\n\n"
             f"💊 {product.brand_name}\n"
-            f"🆔 {product.id}\n"
-            f"🔢 {product.code}"
+            f"🔢 {product.code}\n"
+            f"🆔 {product.id}"
+        )
+
+    except Exception as error:
+
+        db.rollback()
+
+        logger.exception(error)
+
+        await update.message.reply_text(
+            "❌ حدث خطأ أثناء إضافة المنتج."
         )
 
     finally:
@@ -2318,12 +2740,10 @@ async def add_product_form(
 
 
 # ============================================================
-# اختيار صيدلية المستخدم
+# USER PHARMACIES
 # ============================================================
 
-def get_user_pharmacies(
-    user_id
-):
+def get_user_pharmacies(user_id):
 
     db = SessionLocal()
 
@@ -2335,7 +2755,7 @@ def get_user_pharmacies(
             UserPharmacy.user_id == user_id
         ).all()
 
-        pharmacies = []
+        result = []
 
         for link in links:
 
@@ -2346,9 +2766,9 @@ def get_user_pharmacies(
             ).first()
 
             if pharmacy:
-                pharmacies.append(pharmacy)
+                result.append(pharmacy)
 
-        return pharmacies
+        return result
 
     finally:
 
@@ -2356,7 +2776,7 @@ def get_user_pharmacies(
 
 
 # ============================================================
-# عرض صيدلية المستخدم
+# MY PHARMACY
 # ============================================================
 
 async def my_pharmacy_callback(
@@ -2377,8 +2797,7 @@ async def my_pharmacy_callback(
     if not pharmacies:
 
         await query.message.reply_text(
-            "⚠️ لم يتم ربط حسابك بأي صيدلية بعد.\n\n"
-            "يرجى أن يقوم المدير بربط حسابك بالصيدلية."
+            "⚠️ لم يتم ربط حسابك بأي صيدلية بعد."
         )
 
         return
@@ -2392,14 +2811,15 @@ async def my_pharmacy_callback(
             f"🏪 {pharmacy.name}\n"
             f"👤 {pharmacy.owner_name or '-'}\n"
             f"📞 {pharmacy.phone or '-'}\n"
-            f"📍 {pharmacy.city or '-'}\n\n"
+            f"📍 {pharmacy.city or '-'}\n"
+            f"⭐ {pharmacy.classification or '-'}\n\n"
         )
 
     await query.message.reply_text(text)
 
 
 # ============================================================
-# إضافة مخزون الصيدلية
+# ADD PHARMACY STOCK
 # ============================================================
 
 async def pharmacy_add_stock_start(
@@ -2430,7 +2850,7 @@ async def pharmacy_add_stock_start(
     ] = pharmacies[0].id
 
     await query.message.reply_text(
-        "💊 أدخل اسم المنتج أو كود المنتج:"
+        "💊 أدخل اسم المنتج أو الكود:"
     )
 
     return ADD_STOCK_PRODUCT
@@ -2441,25 +2861,30 @@ async def pharmacy_add_stock_product(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    search = update.message.text.strip()
+    value = update.message.text.strip()
 
     db = SessionLocal()
 
     try:
 
-        product = db.query(Product).filter(
-            (Product.code == search)
-            |
-            (Product.brand_name.ilike(
-                f"%{search}%"
-            ))
+        product = db.query(
+            Product
+        ).filter(
+            or_(
+                Product.code == value,
+                Product.brand_name.ilike(
+                    f"%{value}%"
+                ),
+                Product.scientific_name.ilike(
+                    f"%{value}%"
+                )
+            )
         ).first()
 
         if not product:
 
             await update.message.reply_text(
-                "❌ المنتج غير موجود في قاعدة الشركة.\n"
-                "أدخل الاسم أو الكود الصحيح."
+                "❌ المنتج غير موجود."
             )
 
             return ADD_STOCK_PRODUCT
@@ -2469,8 +2894,8 @@ async def pharmacy_add_stock_product(
         ] = product.id
 
         await update.message.reply_text(
-            f"💊 تم اختيار: {product.brand_name}\n\n"
-            "🧪 أدخل رقم التشغيلة Batch Number:"
+            f"💊 المنتج: {product.brand_name}\n\n"
+            "🧪 أدخل رقم التشغيلة:"
         )
 
     finally:
@@ -2490,7 +2915,7 @@ async def pharmacy_add_stock_batch(
     ] = update.message.text.strip()
 
     await update.message.reply_text(
-        "🔢 أدخل الكمية الموجودة:"
+        "🔢 أدخل الكمية:"
     )
 
     return ADD_STOCK_QUANTITY
@@ -2523,10 +2948,8 @@ async def pharmacy_add_stock_quantity(
     ] = quantity
 
     await update.message.reply_text(
-        "📅 أدخل تاريخ الانتهاء بهذا الشكل:\n"
-        "YYYY-MM-DD\n\n"
-        "مثال:\n"
-        "2028-12-31"
+        "📅 أدخل تاريخ الانتهاء:\n"
+        "YYYY-MM-DD"
     )
 
     return ADD_STOCK_EXPIRY
@@ -2547,8 +2970,7 @@ async def pharmacy_add_stock_expiry(
     except ValueError:
 
         await update.message.reply_text(
-            "❌ التاريخ غير صحيح.\n"
-            "استخدم YYYY-MM-DD"
+            "❌ التاريخ غير صحيح."
         )
 
         return ADD_STOCK_EXPIRY
@@ -2559,23 +2981,25 @@ async def pharmacy_add_stock_expiry(
 
     try:
 
-        product_id = context.user_data.get(
+        product_id = context.user_data[
             "stock_product_id"
-        )
+        ]
 
-        pharmacy_id = context.user_data.get(
+        pharmacy_id = context.user_data[
             "stock_pharmacy_id"
-        )
+        ]
 
-        batch_number = context.user_data.get(
+        batch_number = context.user_data[
             "stock_batch_number"
-        )
+        ]
 
-        quantity = context.user_data.get(
+        quantity = context.user_data[
             "stock_quantity"
-        )
+        ]
 
-        batch = db.query(Batch).filter(
+        batch = db.query(
+            Batch
+        ).filter(
             Batch.product_id == product_id,
             Batch.batch_number == batch_number
         ).first()
@@ -2589,13 +3013,14 @@ async def pharmacy_add_stock_expiry(
             )
 
             db.add(batch)
+
             db.commit()
+
             db.refresh(batch)
 
-        else:
+        elif not batch.expiry_date:
 
-            if not batch.expiry_date:
-                batch.expiry_date = expiry
+            batch.expiry_date = expiry
 
         stock = db.query(
             PharmacyStock
@@ -2610,6 +3035,8 @@ async def pharmacy_add_stock_expiry(
             before = stock.quantity
 
             stock.quantity += quantity
+
+            stock.last_reported_by = user_data["id"]
 
             after = stock.quantity
 
@@ -2629,53 +3056,45 @@ async def pharmacy_add_stock_expiry(
 
             db.add(stock)
 
-        movement = StockMovement(
+            db.flush()
 
-            location_type="pharmacy",
-
-            location_id=pharmacy_id,
-
-            product_id=product_id,
-
-            batch_id=batch.id,
-
-            movement_type="إضافة مخزون",
-
-            quantity_before=before,
-
-            quantity_change=quantity,
-
-            quantity_after=after,
-
-            user_id=user_data["id"],
-
-            notes="تم التحديث بواسطة الصيدلية"
-
+        db.add(
+            StockMovement(
+                location_type="pharmacy",
+                location_id=pharmacy_id,
+                product_id=product_id,
+                batch_id=batch.id,
+                movement_type="إضافة مخزون",
+                quantity_before=before,
+                quantity_change=quantity,
+                quantity_after=after,
+                user_id=user_data["id"]
+            )
         )
 
-        db.add(movement)
-
         add_audit_log(
-            db=db,
-            user_id=user_data["id"],
-            action="تحديث مخزون الصيدلية",
-            entity_type="pharmacy_stock",
-            entity_id=stock.id,
-            old_value=str(before),
-            new_value=str(after)
+            db,
+            user_data["id"],
+            "تحديث مخزون الصيدلية",
+            "pharmacy_stock",
+            stock.id,
+            str(before),
+            str(after)
         )
 
         db.commit()
 
-        product = db.query(Product).filter(
+        product = db.query(
+            Product
+        ).filter(
             Product.id == product_id
         ).first()
 
         await update.message.reply_text(
-            "✅ تم تحديث مخزون الصيدلية بنجاح.\n\n"
-            f"💊 المنتج: {product.brand_name}\n"
+            "✅ تم تحديث المخزون.\n\n"
+            f"💊 {product.brand_name}\n"
             f"🧪 التشغيلة: {batch.batch_number}\n"
-            f"🔢 الكمية الحالية: {after}\n"
+            f"🔢 الكمية: {after}\n"
             f"📅 الانتهاء: {expiry}"
         )
 
@@ -2699,7 +3118,7 @@ async def pharmacy_add_stock_expiry(
 
 
 # ============================================================
-# عرض مخزون الصيدلية
+# PHARMACY INVENTORY
 # ============================================================
 
 async def pharmacy_inventory_callback(
@@ -2729,11 +3148,14 @@ async def pharmacy_inventory_callback(
 
     try:
 
-        text = "📦 مخزون صيدليتك:\n\n"
-
-        count = 0
+        text = "📦 مخزون الصيدلية:\n\n"
 
         for pharmacy in pharmacies:
+
+            text += (
+                f"🏪 {pharmacy.name}\n"
+                "────────────────\n"
+            )
 
             stocks = db.query(
                 PharmacyStock
@@ -2742,10 +3164,9 @@ async def pharmacy_inventory_callback(
                 pharmacy.id
             ).all()
 
-            text += (
-                f"🏪 {pharmacy.name}\n"
-                "────────────────\n"
-            )
+            if not stocks:
+
+                text += "لا توجد أصناف.\n\n"
 
             for stock in stocks:
 
@@ -2765,100 +3186,22 @@ async def pharmacy_inventory_callback(
                         Batch.id == stock.batch_id
                     ).first()
 
-                if product:
-
-                    expiry_text = "-"
-
-                    if batch and batch.expiry_date:
-                        expiry_text = str(
-                            batch.expiry_date
-                        )
-
-                    text += (
-                        f"💊 {product.brand_name}\n"
-                        f"🔢 الكمية: {stock.quantity}\n"
-                        f"🧪 التشغيلة: "
-                        f"{batch.batch_number if batch else '-'}\n"
-                        f"📅 الانتهاء: "
-                        f"{expiry_text}\n\n"
-                    )
-
-                    count += 1
-
-                    if len(text) > 3500:
-
-                        await query.message.reply_text(
-                            text
-                        )
-
-                        text = ""
-
-        if count == 0:
-
-            text += "لا توجد أصناف مسجلة."
-
-        if text:
-
-            await query.message.reply_text(text)
-
-    finally:
-
-        db.close()
-
-
-# ============================================================
-# قائمة المنتجات
-# ============================================================
-
-async def products_list_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    db = SessionLocal()
-
-    try:
-
-        products = db.query(Product).filter(
-            Product.is_active == True
-        ).order_by(
-            Product.brand_name
-        ).limit(100).all()
-
-        if not products:
-
-            await query.message.reply_text(
-                "لا توجد منتجات حالياً."
-            )
-
-            return
-
-        text = "💊 قائمة المنتجات:\n\n"
-
-        for product in products:
-
-            text += (
-                f"🆔 {product.id}\n"
-                f"💊 {product.brand_name}\n"
-                f"🔬 {product.scientific_name or '-'}\n"
-                f"⚗️ {product.concentration or '-'}\n"
-                f"💉 {product.dosage_form or '-'}\n\n"
-            )
-
-            if len(text) > 3500:
-
-                await query.message.reply_text(
-                    text
+                text += (
+                    f"💊 {product.brand_name if product else '-'}\n"
+                    f"🔢 الكمية: {stock.quantity}\n"
+                    f"🧪 التشغيلة: "
+                    f"{batch.batch_number if batch else '-'}\n"
+                    f"📅 الانتهاء: "
+                    f"{batch.expiry_date if batch else '-'}\n\n"
                 )
 
-                text = ""
+                if len(text) >= 3500:
+
+                    await query.message.reply_text(text)
+
+                    text = ""
 
         if text:
-
             await query.message.reply_text(text)
 
     finally:
@@ -2867,10 +3210,10 @@ async def products_list_callback(
 
 
 # ============================================================
-# البحث
+# LOW STOCK
 # ============================================================
 
-async def search_start(
+async def pharmacy_low_stock_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -2879,128 +3222,102 @@ async def search_start(
 
     await query.answer()
 
-    await query.message.reply_text(
-        "🔎 أدخل ما تريد البحث عنه:\n\n"
-        "• اسم طبيب\n"
-        "• اسم صيدلية\n"
-        "• اسم منتج\n"
-        "• اسم علمي\n"
-        "• رقم هاتف\n"
-        "• رقم تشغيلة"
+    user_data = get_or_create_user(update)
+
+    pharmacies = get_user_pharmacies(
+        user_data["id"]
     )
 
-    return SEARCH_TEXT
+    if not pharmacies:
 
+        await query.message.reply_text(
+            "❌ لا توجد صيدلية مرتبطة."
+        )
 
-async def search_execute(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    search = update.message.text.strip()
+        return
 
     db = SessionLocal()
 
     try:
 
-        text = f"🔎 نتائج البحث عن: {search}\n\n"
+        text = "⚠️ المخزون المنخفض:\n\n"
 
-        doctors = db.query(Doctor).filter(
-            Doctor.full_name.ilike(
-                f"%{search}%"
-            )
-        ).limit(10).all()
+        found = False
 
-        if doctors:
+        for pharmacy in pharmacies:
 
-            text += "👨‍⚕️ الأطباء:\n"
-
-            for doctor in doctors:
-
-                text += (
-                    f"• {doctor.full_name}\n"
-                    f"  🩺 {doctor.category}\n"
-                    f"  📞 {doctor.phone or '-'}\n"
-                )
-
-            text += "\n"
-
-        pharmacies = db.query(
-            Pharmacy
-        ).filter(
-            Pharmacy.name.ilike(
-                f"%{search}%"
-            )
-        ).limit(10).all()
-
-        if pharmacies:
-
-            text += "🏪 الصيدليات:\n"
-
-            for pharmacy in pharmacies:
-
-                text += (
-                    f"• {pharmacy.name}\n"
-                    f"  📞 {pharmacy.phone or '-'}\n"
-                    f"  📍 {pharmacy.city or '-'}\n"
-                )
-
-            text += "\n"
-
-        products = db.query(Product).filter(
-            (
-                Product.brand_name.ilike(
-                    f"%{search}%"
-                )
-            )
-            |
-            (
-                Product.scientific_name.ilike(
-                    f"%{search}%"
-                )
-            )
-            |
-            (
-                Product.code.ilike(
-                    f"%{search}%"
-                )
-            )
-        ).limit(10).all()
-
-        if products:
-
-            text += "💊 المنتجات:\n"
+            products = db.query(Product).filter(
+                Product.is_active == True
+            ).all()
 
             for product in products:
 
-                text += (
-                    f"• {product.brand_name}\n"
-                    f"  🔢 {product.code}\n"
-                    f"  🔬 {product.scientific_name or '-'}\n"
-                )
+                quantity = db.query(
+                    func.coalesce(
+                        func.sum(
+                            PharmacyStock.quantity
+                        ),
+                        0
+                    )
+                ).filter(
+                    PharmacyStock.pharmacy_id ==
+                    pharmacy.id,
+                    PharmacyStock.product_id ==
+                    product.id
+                ).scalar() or 0
 
-        if (
-            not doctors
-            and not pharmacies
-            and not products
-        ):
+                if (
+                    product.minimum_stock > 0
+                    and quantity <= product.minimum_stock
+                ):
 
-            text += "❌ لم يتم العثور على نتائج."
+                    found = True
 
-        await update.message.reply_text(text)
+                    text += (
+                        f"🏪 {pharmacy.name}\n"
+                        f"💊 {product.brand_name}\n"
+                        f"🔢 الموجود: {quantity}\n"
+                        f"⚠️ الحد الأدنى: "
+                        f"{product.minimum_stock}\n\n"
+                    )
+
+        if not found:
+
+            text += "🟢 لا توجد أصناف منخفضة المخزون."
+
+        await query.message.reply_text(text)
 
     finally:
 
         db.close()
 
-    return ConversationHandler.END
-
 
 # ============================================================
-# التنبيهات
+# EXPIRY
 # ============================================================
 
-def get_expiry_alerts():
+async def pharmacy_expiry_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_data = get_or_create_user(update)
+
+    pharmacies = get_user_pharmacies(
+        user_data["id"]
+    )
+
+    if not pharmacies:
+
+        await query.message.reply_text(
+            "❌ لا توجد صيدلية مرتبطة."
+        )
+
+        return
 
     db = SessionLocal()
 
@@ -3008,21 +3325,77 @@ def get_expiry_alerts():
 
         today = date.today()
 
-        warning_date = (
-            today + timedelta(days=180)
-        )
+        warning = today + timedelta(days=180)
 
-        batches = db.query(Batch).filter(
-            Batch.expiry_date != None,
-            Batch.expiry_date <= warning_date
-        ).all()
+        text = "⏳ التشغيلات القريبة من الانتهاء:\n\n"
 
-        return batches
+        found = False
+
+        for pharmacy in pharmacies:
+
+            stocks = db.query(
+                PharmacyStock
+            ).filter(
+                PharmacyStock.pharmacy_id ==
+                pharmacy.id
+            ).all()
+
+            for stock in stocks:
+
+                if not stock.batch_id:
+                    continue
+
+                batch = db.query(
+                    Batch
+                ).filter(
+                    Batch.id == stock.batch_id
+                ).first()
+
+                if not batch or not batch.expiry_date:
+                    continue
+
+                if batch.expiry_date <= warning:
+
+                    product = db.query(
+                        Product
+                    ).filter(
+                        Product.id == stock.product_id
+                    ).first()
+
+                    found = True
+
+                    if batch.expiry_date < today:
+                        status = "🔴 منتهية"
+                    elif batch.expiry_date <= today + timedelta(days=30):
+                        status = "🔴 أقل من شهر"
+                    elif batch.expiry_date <= today + timedelta(days=90):
+                        status = "🟠 أقل من 3 أشهر"
+                    else:
+                        status = "🟡 أقل من 6 أشهر"
+
+                    text += (
+                        f"{status}\n"
+                        f"🏪 {pharmacy.name}\n"
+                        f"💊 {product.brand_name if product else '-'}\n"
+                        f"🧪 {batch.batch_number}\n"
+                        f"📅 {batch.expiry_date}\n"
+                        f"🔢 الكمية: {stock.quantity}\n\n"
+                    )
+
+        if not found:
+
+            text += "🟢 لا توجد تشغيلات قريبة من الانتهاء."
+
+        await query.message.reply_text(text)
 
     finally:
 
         db.close()
 
+
+# ============================================================
+# ADMIN ALERTS
+# ============================================================
 
 async def alerts_callback(
     update: Update,
@@ -3039,46 +3412,41 @@ async def alerts_callback(
 
         today = date.today()
 
-        three_months = (
-            today + timedelta(days=90)
-        )
+        warning = today + timedelta(days=180)
 
-        one_month = (
-            today + timedelta(days=30)
-        )
-
-        batches = db.query(Batch).filter(
+        batches = db.query(
+            Batch
+        ).filter(
             Batch.expiry_date != None,
-            Batch.expiry_date <= (
-                today + timedelta(days=180)
-            )
+            Batch.expiry_date <= warning
+        ).order_by(
+            Batch.expiry_date
         ).all()
 
         if not batches:
 
             await query.message.reply_text(
-                "🟢 لا توجد تشغيلات قريبة من الانتهاء."
+                "🟢 لا توجد تنبيهات صلاحية."
             )
 
             return
 
-        text = "⚠️ تنبيهات الصلاحية:\n\n"
+        text = "⚠️ تنبيهات التشغيلات:\n\n"
 
         for batch in batches:
 
-            product = db.query(Product).filter(
+            product = db.query(
+                Product
+            ).filter(
                 Product.id == batch.product_id
             ).first()
 
             if batch.expiry_date < today:
-                status = "⚫ منتهي"
-
-            elif batch.expiry_date <= one_month:
+                status = "🔴 منتهي"
+            elif batch.expiry_date <= today + timedelta(days=30):
                 status = "🔴 أقل من شهر"
-
-            elif batch.expiry_date <= three_months:
+            elif batch.expiry_date <= today + timedelta(days=90):
                 status = "🟠 أقل من 3 أشهر"
-
             else:
                 status = "🟡 أقل من 6 أشهر"
 
@@ -3097,73 +3465,7 @@ async def alerts_callback(
 
 
 # ============================================================
-# تقرير إجمالي المنتج
-# ============================================================
-
-def calculate_product_distribution(
-    product_id
-):
-
-    db = SessionLocal()
-
-    try:
-
-        warehouse_total = db.query(
-            func.coalesce(
-                func.sum(
-                    WarehouseStock.quantity
-                ),
-                0
-            )
-        ).filter(
-            WarehouseStock.product_id ==
-            product_id
-        ).scalar()
-
-        pharmacy_total = db.query(
-            func.coalesce(
-                func.sum(
-                    PharmacyStock.quantity
-                ),
-                0
-            )
-        ).filter(
-            PharmacyStock.product_id ==
-            product_id
-        ).scalar()
-
-        pharmacy_count = db.query(
-            func.count(
-                func.distinct(
-                    PharmacyStock.pharmacy_id
-                )
-            )
-        ).filter(
-            PharmacyStock.product_id ==
-            product_id,
-            PharmacyStock.quantity > 0
-        ).scalar()
-
-        return {
-
-            "warehouse_total":
-                warehouse_total or 0,
-
-            "pharmacy_total":
-                pharmacy_total or 0,
-
-            "pharmacy_count":
-                pharmacy_count or 0
-
-        }
-
-    finally:
-
-        db.close()
-
-
-# ============================================================
-# التقارير
+# REPORTS
 # ============================================================
 
 async def reports_callback(
@@ -3175,11 +3477,21 @@ async def reports_callback(
 
     await query.answer()
 
+    user_data = get_or_create_user(update)
+
+    if not is_admin(user_data):
+
+        await query.message.reply_text(
+            "❌ التقرير العام متاح للمدير."
+        )
+
+        return
+
     db = SessionLocal()
 
     try:
 
-        total_doctors = db.query(
+        doctors = db.query(
             func.count(Doctor.id)
         ).scalar() or 0
 
@@ -3189,46 +3501,78 @@ async def reports_callback(
             Doctor.category == "A"
         ).scalar() or 0
 
-        total_pharmacies = db.query(
+        category_b = db.query(
+            func.count(Doctor.id)
+        ).filter(
+            Doctor.category == "B"
+        ).scalar() or 0
+
+        category_c = db.query(
+            func.count(Doctor.id)
+        ).filter(
+            Doctor.category == "C"
+        ).scalar() or 0
+
+        category_d = db.query(
+            func.count(Doctor.id)
+        ).filter(
+            Doctor.category == "D"
+        ).scalar() or 0
+
+        pharmacies = db.query(
             func.count(Pharmacy.id)
         ).scalar() or 0
 
-        total_products = db.query(
+        pharmacists = db.query(
+            func.count(Pharmacist.id)
+        ).scalar() or 0
+
+        products = db.query(
             func.count(Product.id)
         ).scalar() or 0
 
-        low_stock_products = 0
+        hospitals = db.query(
+            func.count(Hospital.id)
+        ).scalar() or 0
 
-        products = db.query(Product).all()
+        warehouses = db.query(
+            func.count(Warehouse.id)
+        ).scalar() or 0
 
-        for product in products:
+        batches = db.query(
+            func.count(Batch.id)
+        ).scalar() or 0
 
-            total = db.query(
-                func.coalesce(
-                    func.sum(
-                        WarehouseStock.quantity
-                    ),
-                    0
-                )
-            ).filter(
-                WarehouseStock.product_id ==
-                product.id
-            ).scalar()
+        visits = db.query(
+            func.count(DoctorVisit.id)
+        ).scalar() or 0
 
-            if (
-                product.minimum_stock > 0
-                and total < product.minimum_stock
-            ):
-                low_stock_products += 1
+        pharmacy_visits = db.query(
+            func.count(PharmacyVisit.id)
+        ).scalar() or 0
+
+        pending_requests = db.query(
+            func.count(VisitRequest.id)
+        ).filter(
+            VisitRequest.status == "pending"
+        ).scalar() or 0
 
         text = (
-            "📊 التقرير العام\n\n"
-            f"👨‍⚕️ إجمالي الأطباء: {total_doctors}\n"
-            f"⭐ أطباء التصنيف A: {category_a}\n"
-            f"🏪 إجمالي الصيدليات: {total_pharmacies}\n"
-            f"💊 إجمالي المنتجات: {total_products}\n"
-            f"📉 منتجات منخفضة المخزون: "
-            f"{low_stock_products}"
+            "📊 التقرير العام للشركة\n\n"
+            f"👨‍⚕️ الأطباء: {doctors}\n"
+            f"  ⭐ A: {category_a}\n"
+            f"  ⭐ B: {category_b}\n"
+            f"  ⭐ C: {category_c}\n"
+            f"  ⭐ D: {category_d}\n\n"
+            f"🏪 الصيدليات: {pharmacies}\n"
+            f"🧑‍🔬 الصيادلة: {pharmacists}\n"
+            f"💊 المنتجات: {products}\n"
+            f"🧪 التشغيلات: {batches}\n"
+            f"🏥 المستشفيات: {hospitals}\n"
+            f"📦 المخازن: {warehouses}\n\n"
+            f"🗓️ زيارات الأطباء: {visits}\n"
+            f"🏪 زيارات الصيدليات: {pharmacy_visits}\n"
+            f"📋 طلبات الزيارة المعلقة: {pending_requests}"
         )
 
         await query.message.reply_text(text)
@@ -3239,7 +3583,7 @@ async def reports_callback(
 
 
 # ============================================================
-# طلب زيارة مندوب
+# REQUEST VISIT
 # ============================================================
 
 async def request_visit_callback(
@@ -3269,18 +3613,11 @@ async def request_visit_callback(
 
     try:
 
-        pharmacy = pharmacies[0]
-
         request = VisitRequest(
-
-            pharmacy_id=pharmacy.id,
-
+            pharmacy_id=pharmacies[0].id,
             requested_by_user_id=user_data["id"],
-
             status="pending",
-
-            notes="طلب زيارة من صاحب الصيدلية"
-
+            notes="طلب زيارة مندوب"
         )
 
         db.add(request)
@@ -3288,9 +3625,32 @@ async def request_visit_callback(
         db.commit()
 
         await query.message.reply_text(
-            "✅ تم إرسال طلب زيارة المندوب.\n"
-            "سيظهر الطلب للإدارة."
+            "✅ تم إرسال طلب زيارة المندوب بنجاح."
         )
+
+        # إشعار المديرين
+        for admin_id in ADMIN_IDS:
+
+            try:
+
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🔔 طلب زيارة جديد\n\n"
+                        f"🏪 الصيدلية: "
+                        f"{pharmacies[0].name}\n"
+                        f"👤 المستخدم: "
+                        f"{user_data['full_name']}\n"
+                        f"🆔 الطلب: {request.id}"
+                    )
+                )
+
+            except Exception as error:
+
+                logger.warning(
+                    "تعذر إرسال إشعار للمدير: %s",
+                    error
+                )
 
     finally:
 
@@ -3298,43 +3658,10 @@ async def request_visit_callback(
 
 
 # ============================================================
-# سجل العمليات
+# SEARCH
 # ============================================================
 
-def add_audit_log(
-    db,
-    user_id,
-    action,
-    entity_type=None,
-    entity_id=None,
-    old_value=None,
-    new_value=None
-):
-
-    log = AuditLog(
-
-        user_id=user_id,
-
-        action=action,
-
-        entity_type=entity_type,
-
-        entity_id=entity_id,
-
-        old_value=old_value,
-
-        new_value=new_value
-
-    )
-
-    db.add(log)
-
-
-# ============================================================
-# عرض الأطباء
-# ============================================================
-
-async def doctors_list_callback(
+async def search_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -3343,52 +3670,1193 @@ async def doctors_list_callback(
 
     await query.answer()
 
+    await query.message.reply_text(
+        "🔎 أدخل ما تريد البحث عنه:\n\n"
+        "• اسم طبيب\n"
+        "• اسم صيدلية\n"
+        "• اسم منتج\n"
+        "• اسم علمي\n"
+        "• رقم هاتف\n"
+        "• كود منتج\n"
+        "• رقم تشغيلة"
+    )
+
+    return SEARCH_TEXT
+
+
+async def search_execute(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    search = update.message.text.strip()
+
     db = SessionLocal()
 
     try:
+
+        text = (
+            f"🔎 نتائج البحث عن:\n"
+            f"{search}\n\n"
+        )
+
+        # ----------------------------------------------------
+        # Doctors
+        # ----------------------------------------------------
 
         doctors = db.query(
             Doctor
-        ).order_by(
-            Doctor.full_name
-        ).limit(50).all()
-
-        if not doctors:
-
-            await query.message.reply_text(
-                "لا يوجد أطباء مسجلون."
+        ).filter(
+            or_(
+                Doctor.full_name.ilike(
+                    f"%{search}%"
+                ),
+                Doctor.phone.ilike(
+                    f"%{search}%"
+                )
             )
+        ).limit(20).all()
 
-            return
+        if doctors:
 
-        text = "👨‍⚕️ قائمة الأطباء:\n\n"
+            text += "👨‍⚕️ الأطباء:\n"
 
-        for doctor in doctors:
+            for doctor in doctors:
 
-            specialty_name = "-"
+                specialty = "-"
 
-            if doctor.specialty:
-                specialty_name = doctor.specialty.name
+                if doctor.specialty:
+                    specialty = doctor.specialty.name
 
-            text += (
-                f"🆔 {doctor.id}\n"
-                f"👨‍⚕️ {doctor.full_name}\n"
-                f"🩺 {specialty_name}\n"
-                f"⭐ التصنيف: {doctor.category}\n"
-                f"📞 {doctor.phone or '-'}\n"
-                f"📍 {doctor.city or '-'}\n\n"
-            )
-
-            if len(text) > 3500:
-
-                await query.message.reply_text(
-                    text
+                text += (
+                    f"• {doctor.full_name}\n"
+                    f"  🩺 {specialty}\n"
+                    f"  📞 {doctor.phone or '-'}\n"
+                    f"  ⭐ {doctor.category}\n"
+                    f"  📍 {doctor.city or '-'}\n\n"
                 )
 
-                text = ""
+        # ----------------------------------------------------
+        # Pharmacies
+        # ----------------------------------------------------
 
-        if text:
-            await query.message.reply_text(text)
+        pharmacies = db.query(
+            Pharmacy
+        ).filter(
+            or_(
+                Pharmacy.name.ilike(
+                    f"%{search}%"
+                ),
+                Pharmacy.phone.ilike(
+                    f"%{search}%"
+                ),
+                Pharmacy.owner_name.ilike(
+                    f"%{search}%"
+                )
+            )
+        ).limit(20).all()
+
+        if pharmacies:
+
+            text += "🏪 الصيدليات:\n"
+
+            for pharmacy in pharmacies:
+
+                text += (
+                    f"• {pharmacy.name}\n"
+                    f"  👤 {pharmacy.owner_name or '-'}\n"
+                    f"  📞 {pharmacy.phone or '-'}\n"
+                    f"  📍 {pharmacy.city or '-'}\n\n"
+                )
+
+        # ----------------------------------------------------
+        # Products
+        # ----------------------------------------------------
+
+        products = db.query(
+            Product
+        ).filter(
+            or_(
+                Product.brand_name.ilike(
+                    f"%{search}%"
+                ),
+                Product.scientific_name.ilike(
+                    f"%{search}%"
+                ),
+                Product.active_ingredient.ilike(
+                    f"%{search}%"
+                ),
+                Product.code.ilike(
+                    f"%{search}%"
+                )
+            )
+        ).limit(20).all()
+
+        if products:
+
+            text += "💊 المنتجات:\n"
+
+            for product in products:
+
+                text += (
+                    f"• {product.brand_name}\n"
+                    f"  🔢 الكود: {product.code}\n"
+                    f"  🔬 العلمي: "
+                    f"{product.scientific_name or '-'}\n"
+                    f"  ⚗️ التركيز: "
+                    f"{product.concentration or '-'}\n\n"
+                )
+
+        # ----------------------------------------------------
+        # Batches
+        # ----------------------------------------------------
+
+        batches = db.query(
+            Batch
+        ).filter(
+            Batch.batch_number.ilike(
+                f"%{search}%"
+            )
+        ).limit(20).all()
+
+        if batches:
+
+            text += "🧪 التشغيلات:\n"
+
+            for batch in batches:
+
+                product = db.query(
+                    Product
+                ).filter(
+                    Product.id == batch.product_id
+                ).first()
+
+                text += (
+                    f"• التشغيلة: "
+                    f"{batch.batch_number}\n"
+                    f"  💊 المنتج: "
+                    f"{product.brand_name if product else '-'}\n"
+                    f"  📅 الانتهاء: "
+                    f"{batch.expiry_date or '-'}\n\n"
+                )
+
+        # ----------------------------------------------------
+        # Pharmacists
+        # ----------------------------------------------------
+
+        pharmacists = db.query(
+            Pharmacist
+        ).filter(
+            or_(
+                Pharmacist.full_name.ilike(
+                    f"%{search}%"
+                ),
+                Pharmacist.phone.ilike(
+                    f"%{search}%"
+                )
+            )
+        ).limit(20).all()
+
+        if pharmacists:
+
+            text += "🧑‍🔬 الصيادلة:\n"
+
+            for pharmacist in pharmacists:
+
+                pharmacy_name = "-"
+
+                if pharmacist.pharmacy:
+                    pharmacy_name = pharmacist.pharmacy.name
+
+                text += (
+                    f"• {pharmacist.full_name}\n"
+                    f"  📞 {pharmacist.phone or '-'}\n"
+                    f"  🏪 {pharmacy_name}\n\n"
+                )
+
+        if text.endswith(
+            f"{search}\n\n"
+        ):
+
+            text += "❌ لم يتم العثور على نتائج."
+
+        # Telegram limit
+        chunks = []
+
+        while len(text) > 3500:
+
+            split_at = text.rfind(
+                "\n",
+                0,
+                3500
+            )
+
+            if split_at <= 0:
+                split_at = 3500
+
+            chunks.append(
+                text[:split_at]
+            )
+
+            text = text[split_at:]
+
+        chunks.append(text)
+
+        for chunk in chunks:
+
+            if chunk.strip():
+
+                await update.message.reply_text(
+                    chunk
+                )
+
+    finally:
+
+        db.close()
+
+    return ConversationHandler.END
+
+
+# ============================================================
+# EXCEL HELPERS
+# ============================================================
+
+def excel_value(value):
+
+    if value is None:
+        return ""
+
+    if isinstance(value, datetime):
+        return value.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    if isinstance(value, date):
+        return value.strftime(
+            "%Y-%m-%d"
+        )
+
+    if isinstance(value, bool):
+        return "نعم" if value else "لا"
+
+    return value
+
+
+def add_sheet(
+    workbook,
+    title,
+    headers,
+    rows
+):
+
+    ws = workbook.create_sheet(title)
+
+    ws.append(headers)
+
+    for cell in ws[1]:
+
+        cell.font = cell.font.copy(
+            bold=True
+        )
+
+    for row in rows:
+
+        ws.append(
+            [
+                excel_value(value)
+                for value in row
+            ]
+        )
+
+    # Auto width
+    for column_cells in ws.columns:
+
+        max_length = 0
+
+        column_letter = get_column_letter(
+            column_cells[0].column
+        )
+
+        for cell in column_cells:
+
+            value = str(
+                cell.value or ""
+            )
+
+            if len(value) > max_length:
+                max_length = len(value)
+
+        ws.column_dimensions[
+            column_letter
+        ].width = min(
+            max(max_length + 2, 10),
+            50
+        )
+
+    ws.freeze_panes = "A2"
+
+    ws.auto_filter.ref = ws.dimensions
+
+    return ws
+
+
+# ============================================================
+# BUILD EXCEL
+# ============================================================
+
+def build_excel_file(
+    user_data
+):
+
+    db = SessionLocal()
+
+    try:
+
+        workbook = Workbook()
+
+        default = workbook.active
+
+        workbook.remove(default)
+
+        # ----------------------------------------------------
+        # USERS
+        # ----------------------------------------------------
+
+        users = db.query(User).all()
+
+        add_sheet(
+            workbook,
+            "المستخدمون",
+            [
+                "ID",
+                "Telegram ID",
+                "الاسم",
+                "Username",
+                "الهاتف",
+                "الصلاحية",
+                "فعال",
+                "تاريخ الإنشاء"
+            ],
+            [
+                (
+                    u.id,
+                    u.telegram_id,
+                    u.full_name,
+                    u.username,
+                    u.phone,
+                    u.role,
+                    u.is_active,
+                    u.created_at
+                )
+                for u in users
+            ]
+        )
+
+        # ----------------------------------------------------
+        # DOCTORS
+        # ----------------------------------------------------
+
+        doctors = db.query(
+            Doctor
+        ).all()
+
+        doctor_rows = []
+
+        for d in doctors:
+
+            specialty = (
+                d.specialty.name
+                if d.specialty
+                else ""
+            )
+
+            doctor_rows.append(
+                (
+                    d.id,
+                    d.full_name,
+                    d.phone,
+                    specialty,
+                    d.category,
+                    d.scientific_degree,
+                    d.governorate,
+                    d.city,
+                    d.district,
+                    d.address,
+                    d.working_days,
+                    d.working_hours,
+                    d.importance_score,
+                    d.prescription_score,
+                    d.last_visit_date,
+                    d.next_visit_date,
+                    d.assigned_rep_id,
+                    d.notes,
+                    d.is_active,
+                    d.created_at
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "الأطباء",
+            [
+                "ID",
+                "الاسم",
+                "الهاتف",
+                "التخصص",
+                "التصنيف",
+                "الدرجة العلمية",
+                "المحافظة",
+                "المدينة",
+                "المديرية",
+                "العنوان",
+                "أيام العمل",
+                "ساعات العمل",
+                "درجة الأهمية",
+                "درجة الوصفات",
+                "آخر زيارة",
+                "الزيارة القادمة",
+                "المندوب",
+                "ملاحظات",
+                "فعال",
+                "تاريخ التسجيل"
+            ],
+            doctor_rows
+        )
+
+        # ----------------------------------------------------
+        # PHARMACIES
+        # ----------------------------------------------------
+
+        pharmacies = db.query(
+            Pharmacy
+        ).all()
+
+        add_sheet(
+            workbook,
+            "الصيدليات",
+            [
+                "ID",
+                "اسم الصيدلية",
+                "صاحب الصيدلية",
+                "الهاتف",
+                "المحافظة",
+                "المدينة",
+                "المديرية",
+                "العنوان",
+                "Latitude",
+                "Longitude",
+                "التصنيف",
+                "المندوب",
+                "آخر زيارة",
+                "الزيارة القادمة",
+                "ملاحظات",
+                "فعال",
+                "تاريخ التسجيل"
+            ],
+            [
+                (
+                    p.id,
+                    p.name,
+                    p.owner_name,
+                    p.phone,
+                    p.governorate,
+                    p.city,
+                    p.district,
+                    p.address,
+                    p.latitude,
+                    p.longitude,
+                    p.classification,
+                    p.assigned_rep_id,
+                    p.last_visit_date,
+                    p.next_visit_date,
+                    p.notes,
+                    p.is_active,
+                    p.created_at
+                )
+                for p in pharmacies
+            ]
+        )
+
+        # ----------------------------------------------------
+        # PHARMACISTS
+        # ----------------------------------------------------
+
+        pharmacists = db.query(
+            Pharmacist
+        ).all()
+
+        pharmacist_rows = []
+
+        for p in pharmacists:
+
+            pharmacy_name = ""
+
+            if p.pharmacy:
+                pharmacy_name = p.pharmacy.name
+
+            pharmacist_rows.append(
+                (
+                    p.id,
+                    p.full_name,
+                    p.phone,
+                    p.pharmacy_id,
+                    pharmacy_name,
+                    p.classification,
+                    p.notes
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "الصيادلة",
+            [
+                "ID",
+                "الاسم",
+                "الهاتف",
+                "Pharmacy ID",
+                "الصيدلية",
+                "التصنيف",
+                "ملاحظات"
+            ],
+            pharmacist_rows
+        )
+
+        # ----------------------------------------------------
+        # PRODUCTS
+        # ----------------------------------------------------
+
+        products = db.query(
+            Product
+        ).all()
+
+        add_sheet(
+            workbook,
+            "المنتجات",
+            [
+                "ID",
+                "الكود",
+                "الاسم التجاري",
+                "الاسم العلمي",
+                "المادة الفعالة",
+                "التركيز",
+                "الشكل الدوائي",
+                "حجم العبوة",
+                "الفئة العلاجية",
+                "الشركة المصنعة",
+                "بلد المنشأ",
+                "السعر",
+                "الحد الأدنى للمخزون",
+                "الملاحظات العلمية",
+                "فعال",
+                "تاريخ التسجيل"
+            ],
+            [
+                (
+                    p.id,
+                    p.code,
+                    p.brand_name,
+                    p.scientific_name,
+                    p.active_ingredient,
+                    p.concentration,
+                    p.dosage_form,
+                    p.package_size,
+                    p.therapeutic_class,
+                    p.manufacturer,
+                    p.country_of_origin,
+                    p.price,
+                    p.minimum_stock,
+                    p.scientific_notes,
+                    p.is_active,
+                    p.created_at
+                )
+                for p in products
+            ]
+        )
+
+        # ----------------------------------------------------
+        # BATCHES
+        # ----------------------------------------------------
+
+        batches = db.query(
+            Batch
+        ).all()
+
+        batch_rows = []
+
+        for b in batches:
+
+            product_name = ""
+
+            if b.product:
+                product_name = b.product.brand_name
+
+            batch_rows.append(
+                (
+                    b.id,
+                    b.product_id,
+                    product_name,
+                    b.batch_number,
+                    b.manufacture_date,
+                    b.expiry_date
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "التشغيلات",
+            [
+                "ID",
+                "Product ID",
+                "المنتج",
+                "رقم التشغيلة",
+                "تاريخ التصنيع",
+                "تاريخ الانتهاء"
+            ],
+            batch_rows
+        )
+
+        # ----------------------------------------------------
+        # HOSPITALS
+        # ----------------------------------------------------
+
+        hospitals = db.query(
+            Hospital
+        ).all()
+
+        add_sheet(
+            workbook,
+            "المستشفيات",
+            [
+                "ID",
+                "الاسم",
+                "النوع",
+                "المحافظة",
+                "المدينة",
+                "المديرية",
+                "العنوان",
+                "الهاتف",
+                "ملاحظات"
+            ],
+            [
+                (
+                    h.id,
+                    h.name,
+                    h.hospital_type,
+                    h.governorate,
+                    h.city,
+                    h.district,
+                    h.address,
+                    h.phone,
+                    h.notes
+                )
+                for h in hospitals
+            ]
+        )
+
+        # ----------------------------------------------------
+        # WAREHOUSES
+        # ----------------------------------------------------
+
+        warehouses = db.query(
+            Warehouse
+        ).all()
+
+        add_sheet(
+            workbook,
+            "المخازن",
+            [
+                "ID",
+                "الاسم",
+                "المحافظة",
+                "المدينة",
+                "العنوان",
+                "المدير",
+                "الهاتف",
+                "فعال"
+            ],
+            [
+                (
+                    w.id,
+                    w.name,
+                    w.governorate,
+                    w.city,
+                    w.address,
+                    w.manager_name,
+                    w.phone,
+                    w.is_active
+                )
+                for w in warehouses
+            ]
+        )
+
+        # ----------------------------------------------------
+        # WAREHOUSE STOCK
+        # ----------------------------------------------------
+
+        warehouse_stock = db.query(
+            WarehouseStock
+        ).all()
+
+        warehouse_stock_rows = []
+
+        for s in warehouse_stock:
+
+            warehouse_name = (
+                s.warehouse.name
+                if s.warehouse
+                else ""
+            )
+
+            product_name = (
+                s.product.brand_name
+                if s.product
+                else ""
+            )
+
+            batch_number = (
+                s.batch.batch_number
+                if s.batch
+                else ""
+            )
+
+            warehouse_stock_rows.append(
+                (
+                    s.id,
+                    s.warehouse_id,
+                    warehouse_name,
+                    s.product_id,
+                    product_name,
+                    s.batch_id,
+                    batch_number,
+                    s.quantity,
+                    s.reserved_quantity,
+                    s.updated_at
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "مخزون المخازن",
+            [
+                "ID",
+                "Warehouse ID",
+                "المخزن",
+                "Product ID",
+                "المنتج",
+                "Batch ID",
+                "التشغيلة",
+                "الكمية",
+                "الكمية المحجوزة",
+                "آخر تحديث"
+            ],
+            warehouse_stock_rows
+        )
+
+        # ----------------------------------------------------
+        # PHARMACY STOCK
+        # ----------------------------------------------------
+
+        pharmacy_stock = db.query(
+            PharmacyStock
+        ).all()
+
+        pharmacy_stock_rows = []
+
+        for s in pharmacy_stock:
+
+            pharmacy_name = (
+                s.pharmacy.name
+                if s.pharmacy
+                else ""
+            )
+
+            product_name = (
+                s.product.brand_name
+                if s.product
+                else ""
+            )
+
+            batch_number = (
+                s.batch.batch_number
+                if s.batch
+                else ""
+            )
+
+            pharmacy_stock_rows.append(
+                (
+                    s.id,
+                    s.pharmacy_id,
+                    pharmacy_name,
+                    s.product_id,
+                    product_name,
+                    s.batch_id,
+                    batch_number,
+                    s.quantity,
+                    s.last_reported_by,
+                    s.updated_at
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "مخزون الصيدليات",
+            [
+                "ID",
+                "Pharmacy ID",
+                "الصيدلية",
+                "Product ID",
+                "المنتج",
+                "Batch ID",
+                "التشغيلة",
+                "الكمية",
+                "تم التحديث بواسطة",
+                "آخر تحديث"
+            ],
+            pharmacy_stock_rows
+        )
+
+        # ----------------------------------------------------
+        # STOCK MOVEMENTS
+        # ----------------------------------------------------
+
+        movements = db.query(
+            StockMovement
+        ).order_by(
+            StockMovement.created_at.desc()
+        ).all()
+
+        add_sheet(
+            workbook,
+            "حركات المخزون",
+            [
+                "ID",
+                "نوع الموقع",
+                "Location ID",
+                "Product ID",
+                "Batch ID",
+                "نوع الحركة",
+                "قبل",
+                "التغيير",
+                "بعد",
+                "User ID",
+                "ملاحظات",
+                "التاريخ"
+            ],
+            [
+                (
+                    m.id,
+                    m.location_type,
+                    m.location_id,
+                    m.product_id,
+                    m.batch_id,
+                    m.movement_type,
+                    m.quantity_before,
+                    m.quantity_change,
+                    m.quantity_after,
+                    m.user_id,
+                    m.notes,
+                    m.created_at
+                )
+                for m in movements
+            ]
+        )
+
+        # ----------------------------------------------------
+        # DOCTOR VISITS
+        # ----------------------------------------------------
+
+        visits = db.query(
+            DoctorVisit
+        ).order_by(
+            DoctorVisit.visit_date.desc()
+        ).all()
+
+        visit_rows = []
+
+        for v in visits:
+
+            doctor_name = (
+                v.doctor.full_name
+                if v.doctor
+                else ""
+            )
+
+            visit_rows.append(
+                (
+                    v.id,
+                    v.doctor_id,
+                    doctor_name,
+                    v.representative_id,
+                    v.visit_date,
+                    v.interest_level,
+                    v.notes,
+                    v.next_visit_date
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "زيارات الأطباء",
+            [
+                "ID",
+                "Doctor ID",
+                "الطبيب",
+                "المندوب",
+                "تاريخ الزيارة",
+                "مستوى الاهتمام",
+                "ملاحظات",
+                "الزيارة القادمة"
+            ],
+            visit_rows
+        )
+
+        # ----------------------------------------------------
+        # PHARMACY VISITS
+        # ----------------------------------------------------
+
+        pharmacy_visits = db.query(
+            PharmacyVisit
+        ).order_by(
+            PharmacyVisit.visit_date.desc()
+        ).all()
+
+        pharmacy_visit_rows = []
+
+        for v in pharmacy_visits:
+
+            pharmacy_name = ""
+
+            if v.pharmacy:
+                pharmacy_name = v.pharmacy.name
+
+            pharmacy_visit_rows.append(
+                (
+                    v.id,
+                    v.pharmacy_id,
+                    pharmacy_name,
+                    v.representative_id,
+                    v.visit_date,
+                    v.notes,
+                    v.next_visit_date
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "زيارات الصيدليات",
+            [
+                "ID",
+                "Pharmacy ID",
+                "الصيدلية",
+                "المندوب",
+                "تاريخ الزيارة",
+                "ملاحظات",
+                "الزيارة القادمة"
+            ],
+            pharmacy_visit_rows
+        )
+
+        # ----------------------------------------------------
+        # VISIT REQUESTS
+        # ----------------------------------------------------
+
+        requests = db.query(
+            VisitRequest
+        ).order_by(
+            VisitRequest.created_at.desc()
+        ).all()
+
+        request_rows = []
+
+        for r in requests:
+
+            pharmacy_name = ""
+
+            if r.pharmacy:
+                pharmacy_name = r.pharmacy.name
+
+            request_rows.append(
+                (
+                    r.id,
+                    r.pharmacy_id,
+                    pharmacy_name,
+                    r.requested_by_user_id,
+                    r.status,
+                    r.notes,
+                    r.created_at
+                )
+            )
+
+        add_sheet(
+            workbook,
+            "طلبات الزيارات",
+            [
+                "ID",
+                "Pharmacy ID",
+                "الصيدلية",
+                "طلب بواسطة",
+                "الحالة",
+                "ملاحظات",
+                "تاريخ الطلب"
+            ],
+            request_rows
+        )
+
+        # ----------------------------------------------------
+        # REMINDERS
+        # ----------------------------------------------------
+
+        reminders = db.query(
+            Reminder
+        ).all()
+
+        add_sheet(
+            workbook,
+            "التذكيرات",
+            [
+                "ID",
+                "User ID",
+                "العنوان",
+                "الرسالة",
+                "تاريخ التذكير",
+                "تم الإرسال"
+            ],
+            [
+                (
+                    r.id,
+                    r.user_id,
+                    r.title,
+                    r.message,
+                    r.reminder_date,
+                    r.is_sent
+                )
+                for r in reminders
+            ]
+        )
+
+        # ----------------------------------------------------
+        # AUDIT LOG
+        # ----------------------------------------------------
+
+        logs = db.query(
+            AuditLog
+        ).order_by(
+            AuditLog.created_at.desc()
+        ).all()
+
+        add_sheet(
+            workbook,
+            "سجل العمليات",
+            [
+                "ID",
+                "User ID",
+                "العملية",
+                "نوع البيانات",
+                "Entity ID",
+                "القيمة السابقة",
+                "القيمة الجديدة",
+                "التاريخ"
+            ],
+            [
+                (
+                    l.id,
+                    l.user_id,
+                    l.action,
+                    l.entity_type,
+                    l.entity_id,
+                    l.old_value,
+                    l.new_value,
+                    l.created_at
+                )
+                for l in logs
+            ]
+        )
+
+        # ----------------------------------------------------
+        # SUMMARY
+        # ----------------------------------------------------
+
+        summary = workbook.create_sheet(
+            "ملخص النظام",
+            0
+        )
+
+        summary.append(
+            [
+                "المؤشر",
+                "العدد"
+            ]
+        )
+
+        summary_data = [
+            (
+                "الأطباء",
+                db.query(func.count(Doctor.id)).scalar() or 0
+            ),
+            (
+                "الصيدليات",
+                db.query(func.count(Pharmacy.id)).scalar() or 0
+            ),
+            (
+                "الصيادلة",
+                db.query(func.count(Pharmacist.id)).scalar() or 0
+            ),
+            (
+                "المنتجات",
+                db.query(func.count(Product.id)).scalar() or 0
+            ),
+            (
+                "التشغيلات",
+                db.query(func.count(Batch.id)).scalar() or 0
+            ),
+            (
+                "المستشفيات",
+                db.query(func.count(Hospital.id)).scalar() or 0
+            ),
+            (
+                "المخازن",
+                db.query(func.count(Warehouse.id)).scalar() or 0
+            ),
+            (
+                "المستخدمون",
+                db.query(func.count(User.id)).scalar() or 0
+            ),
+            (
+                "زيارات الأطباء",
+                db.query(func.count(DoctorVisit.id)).scalar() or 0
+            ),
+            (
+                "زيارات الصيدليات",
+                db.query(func.count(PharmacyVisit.id)).scalar() or 0
+            ),
+            (
+                "طلبات الزيارة",
+                db.query(func.count(VisitRequest.id)).scalar() or 0
+            ),
+        ]
+
+        for row in summary_data:
+            summary.append(row)
+
+        for cell in summary[1]:
+            cell.font = cell.font.copy(
+                bold=True
+            )
+
+        summary.column_dimensions["A"].width = 30
+        summary.column_dimensions["B"].width = 20
+
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
+
+        output = BytesIO()
+
+        workbook.save(output)
+
+        output.seek(0)
+
+        return output
 
     finally:
 
@@ -3396,10 +4864,77 @@ async def doctors_list_callback(
 
 
 # ============================================================
-# عرض الصيدليات
+# EXPORT EXCEL
 # ============================================================
 
-async def pharmacies_list_callback(
+async def export_excel_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer(
+        "جاري تجهيز ملف Excel..."
+    )
+
+    user_data = get_or_create_user(update)
+
+    if not user_data:
+
+        return
+
+    try:
+
+        excel_file = build_excel_file(
+            user_data
+        )
+
+        filename = (
+            "medical_company_data_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+
+        await query.message.reply_document(
+            document=excel_file,
+            filename=filename,
+            caption=(
+                "📊 تم استخراج بيانات النظام بالكامل إلى Excel.\n\n"
+                "يحتوي الملف على:\n"
+                "• ملخص النظام\n"
+                "• الأطباء\n"
+                "• الصيدليات\n"
+                "• الصيادلة\n"
+                "• المنتجات\n"
+                "• التشغيلات\n"
+                "• المستشفيات\n"
+                "• المخازن\n"
+                "• مخزون المخازن\n"
+                "• مخزون الصيدليات\n"
+                "• حركات المخزون\n"
+                "• زيارات الأطباء\n"
+                "• زيارات الصيدليات\n"
+                "• طلبات الزيارات\n"
+                "• المستخدمين\n"
+                "• التذكيرات\n"
+                "• سجل العمليات"
+            )
+        )
+
+    except Exception as error:
+
+        logger.exception(error)
+
+        await query.message.reply_text(
+            "❌ حدث خطأ أثناء إنشاء ملف Excel."
+        )
+
+
+# ============================================================
+# TODAY VISITS
+# ============================================================
+
+async def today_visits_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
@@ -3408,34 +4943,114 @@ async def pharmacies_list_callback(
 
     await query.answer()
 
+    user_data = get_or_create_user(update)
+
     db = SessionLocal()
 
     try:
 
-        pharmacies = db.query(
-            Pharmacy
-        ).order_by(
-            Pharmacy.name
-        ).limit(50).all()
+        today = date.today()
 
-        if not pharmacies:
+        doctor_visits = db.query(
+            DoctorVisit
+        ).filter(
+            DoctorVisit.visit_date == today
+        ).all()
+
+        pharmacy_visits = db.query(
+            PharmacyVisit
+        ).filter(
+            PharmacyVisit.visit_date == today
+        ).all()
+
+        text = (
+            f"🗓️ زيارات اليوم\n"
+            f"📅 {today}\n\n"
+        )
+
+        text += "👨‍⚕️ زيارات الأطباء:\n"
+
+        if doctor_visits:
+
+            for visit in doctor_visits:
+
+                doctor = visit.doctor
+
+                text += (
+                    f"• {doctor.full_name if doctor else '-'}\n"
+                    f"  📝 {visit.notes or '-'}\n\n"
+                )
+
+        else:
+
+            text += "لا توجد زيارات أطباء.\n\n"
+
+        text += "🏪 زيارات الصيدليات:\n"
+
+        if pharmacy_visits:
+
+            for visit in pharmacy_visits:
+
+                text += (
+                    f"• الصيدلية رقم {visit.pharmacy_id}\n"
+                    f"  📝 {visit.notes or '-'}\n\n"
+                )
+
+        else:
+
+            text += "لا توجد زيارات صيدليات."
+
+        await query.message.reply_text(text)
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# MY REMINDERS
+# ============================================================
+
+async def my_reminders_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    user_data = get_or_create_user(update)
+
+    db = SessionLocal()
+
+    try:
+
+        reminders = db.query(
+            Reminder
+        ).filter(
+            Reminder.user_id == user_data["id"],
+            Reminder.is_sent == False
+        ).order_by(
+            Reminder.reminder_date
+        ).all()
+
+        if not reminders:
 
             await query.message.reply_text(
-                "لا توجد صيدليات مسجلة."
+                "🔔 لا توجد تذكيرات حالياً."
             )
 
             return
 
-        text = "🏪 قائمة الصيدليات:\n\n"
+        text = "🔔 تذكيراتي:\n\n"
 
-        for pharmacy in pharmacies:
+        for reminder in reminders:
 
             text += (
-                f"🆔 {pharmacy.id}\n"
-                f"🏪 {pharmacy.name}\n"
-                f"👤 {pharmacy.owner_name or '-'}\n"
-                f"📞 {pharmacy.phone or '-'}\n"
-                f"📍 {pharmacy.city or '-'}\n\n"
+                f"📌 {reminder.title}\n"
+                f"📝 {reminder.message or '-'}\n"
+                f"📅 {reminder.reminder_date}\n\n"
             )
 
         await query.message.reply_text(text)
@@ -3446,80 +5061,65 @@ async def pharmacies_list_callback(
 
 
 # ============================================================
-# إضافة تخصصات افتراضية
+# PHARMACY PRODUCTS
 # ============================================================
 
-def seed_specialties():
+async def pharmacy_products_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
-    specialties = [
+    query = update.callback_query
 
-        "طب عام",
+    await query.answer()
 
-        "الباطنية",
+    user_data = get_or_create_user(update)
 
-        "الأطفال",
+    pharmacies = get_user_pharmacies(
+        user_data["id"]
+    )
 
-        "النساء والولادة",
+    if not pharmacies:
 
-        "القلب",
+        await query.message.reply_text(
+            "❌ لا توجد صيدلية مرتبطة."
+        )
 
-        "الجراحة",
-
-        "العظام",
-
-        "الأنف والأذن والحنجرة",
-
-        "الجلدية",
-
-        "العيون",
-
-        "المسالك البولية",
-
-        "الأعصاب",
-
-        "الأورام",
-
-        "الأسنان",
-
-        "الغدد الصماء",
-
-        "الكلى",
-
-        "الجهاز الهضمي",
-
-        "الصدرية",
-
-        "الطوارئ",
-
-        "التخدير",
-
-        "الأشعة",
-
-        "المختبرات"
-
-    ]
+        return
 
     db = SessionLocal()
 
     try:
 
-        for name in specialties:
+        text = "📋 قائمة أصناف الصيدلية:\n\n"
 
-            existing = db.query(
-                Specialty
+        for pharmacy in pharmacies:
+
+            stocks = db.query(
+                PharmacyStock
             ).filter(
-                Specialty.name == name
-            ).first()
+                PharmacyStock.pharmacy_id ==
+                pharmacy.id
+            ).all()
 
-            if not existing:
+            text += (
+                f"🏪 {pharmacy.name}\n\n"
+            )
 
-                db.add(
-                    Specialty(
-                        name=name
+            for stock in stocks:
+
+                product = stock.product
+
+                if product:
+
+                    text += (
+                        f"💊 {product.brand_name}\n"
+                        f"🔢 {stock.quantity}\n"
+                        f"🧪 "
+                        f"{stock.batch.batch_number if stock.batch else '-'}\n\n"
                     )
-                )
 
-        db.commit()
+        await query.message.reply_text(text)
 
     finally:
 
@@ -3527,78 +5127,45 @@ def seed_specialties():
 
 
 # ============================================================
-# معالجة الأزرار
+# PHARMACY NOTE
 # ============================================================
 
-async def menu_callback(
+async def pharmacy_note_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
 
-    data = query.data
+    await query.answer()
 
-    if data == "admin_doctors":
-
-        await doctors_list_callback(
-            update,
-            context
-        )
-
-    elif data == "admin_pharmacies":
-
-        await pharmacies_list_callback(
-            update,
-            context
-        )
-
-    elif data == "rep_doctors":
-
-        await doctors_list_callback(
-            update,
-            context
-        )
-
-    elif data == "rep_pharmacies":
-
-        await pharmacies_list_callback(
-            update,
-            context
-        )
-
-    elif data == "products_list":
-
-        await products_list_callback(
-            update,
-            context
-        )
-
-    elif data == "admin_alerts":
-
-        await alerts_callback(
-            update,
-            context
-        )
-
-    elif data == "admin_reports":
-
-        await reports_callback(
-            update,
-            context
-        )
-
-    else:
-
-        await query.answer()
-
-        await query.message.reply_text(
-            "⚠️ هذه الخاصية ستكون متاحة في القائمة الكاملة."
-        )
+    await query.message.reply_text(
+        "💬 لإرسال ملاحظة، أرسلها في رسالة منفصلة إلى الإدارة."
+    )
 
 
 # ============================================================
-# إلغاء المحادثة
+# PLACEHOLDER STOCK UPDATE
+# ============================================================
+
+async def pharmacy_update_stock_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    await query.answer()
+
+    await query.message.reply_text(
+        "✏️ تحديث كمية المخزون:\n\n"
+        "يمكنك استخدام «➕ إضافة صنف» لإضافة الكمية الجديدة "
+        "وسيتم دمجها تلقائياً مع كمية الصنف الموجودة."
+    )
+
+
+# ============================================================
+# CANCEL
 # ============================================================
 
 async def cancel(
@@ -3616,7 +5183,7 @@ async def cancel(
 
 
 # ============================================================
-# الأوامر الإدارية
+# LINK PHARMACY
 # ============================================================
 
 async def add_pharmacy_user_command(
@@ -3634,15 +5201,262 @@ async def add_pharmacy_user_command(
 
         return
 
-    await update.message.reply_text(
-        "لاستخدام الربط استخدم لاحقاً لوحة الإدارة.\n\n"
-        "صيغة قاعدة البيانات:\n"
-        "ربط user_id مع pharmacy_id."
-    )
+    if len(context.args) < 2:
+
+        await update.message.reply_text(
+            "الاستخدام:\n"
+            "/link_pharmacy USER_ID PHARMACY_ID"
+        )
+
+        return
+
+    try:
+
+        target_user_id = int(
+            context.args[0]
+        )
+
+        pharmacy_id = int(
+            context.args[1]
+        )
+
+    except ValueError:
+
+        await update.message.reply_text(
+            "❌ يجب أن تكون الأرقام صحيحة."
+        )
+
+        return
+
+    db = SessionLocal()
+
+    try:
+
+        user = db.query(User).filter(
+            User.id == target_user_id
+        ).first()
+
+        pharmacy = db.query(
+            Pharmacy
+        ).filter(
+            Pharmacy.id == pharmacy_id
+        ).first()
+
+        if not user:
+
+            await update.message.reply_text(
+                "❌ المستخدم غير موجود."
+            )
+
+            return
+
+        if not pharmacy:
+
+            await update.message.reply_text(
+                "❌ الصيدلية غير موجودة."
+            )
+
+            return
+
+        existing = db.query(
+            UserPharmacy
+        ).filter(
+            UserPharmacy.user_id == user.id,
+            UserPharmacy.pharmacy_id == pharmacy.id
+        ).first()
+
+        if existing:
+
+            await update.message.reply_text(
+                "ℹ️ الربط موجود مسبقاً."
+            )
+
+            return
+
+        db.add(
+            UserPharmacy(
+                user_id=user.id,
+                pharmacy_id=pharmacy.id
+            )
+        )
+
+        db.commit()
+
+        await update.message.reply_text(
+            "✅ تم ربط المستخدم بالصيدلية بنجاح."
+        )
+
+    except Exception as error:
+
+        db.rollback()
+
+        logger.exception(error)
+
+        await update.message.reply_text(
+            "❌ حدث خطأ أثناء الربط."
+        )
+
+    finally:
+
+        db.close()
 
 
 # ============================================================
-# معالجة الأخطاء
+# SPECIALTIES SEED
+# ============================================================
+
+def seed_specialties():
+
+    specialties = [
+        "طب عام",
+        "الباطنية",
+        "الأطفال",
+        "النساء والولادة",
+        "القلب",
+        "الجراحة",
+        "العظام",
+        "الأنف والأذن والحنجرة",
+        "الجلدية",
+        "العيون",
+        "المسالك البولية",
+        "الأعصاب",
+        "الأورام",
+        "الأسنان",
+        "الغدد الصماء",
+        "الكلى",
+        "الجهاز الهضمي",
+        "الصدرية",
+        "الطوارئ",
+        "التخدير",
+        "الأشعة",
+        "المختبرات"
+    ]
+
+    db = SessionLocal()
+
+    try:
+
+        for name in specialties:
+
+            existing = db.query(
+                Specialty
+            ).filter(
+                Specialty.name == name
+            ).first()
+
+            if not existing:
+
+                db.add(
+                    Specialty(name=name)
+                )
+
+        db.commit()
+
+    finally:
+
+        db.close()
+
+
+# ============================================================
+# GENERAL MENU CALLBACK
+# ============================================================
+
+async def menu_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+
+    data = query.data
+
+    # يجب ألا نترك أي زر بدون تنفيذ
+
+    if data == "admin_doctors":
+        await doctors_list_callback(update, context)
+
+    elif data == "admin_pharmacies":
+        await pharmacies_list_callback(update, context)
+
+    elif data == "admin_products":
+        await products_list_callback(update, context)
+
+    elif data == "admin_pharmacists":
+        await pharmacists_list_callback(update, context)
+
+    elif data == "admin_hospitals":
+        await hospitals_list_callback(update, context)
+
+    elif data == "admin_warehouses":
+        await warehouses_list_callback(update, context)
+
+    elif data == "admin_users":
+        await users_list_callback(update, context)
+
+    elif data == "rep_doctors":
+        await doctors_list_callback(update, context)
+
+    elif data == "rep_pharmacies":
+        await pharmacies_list_callback(update, context)
+
+    elif data == "products_list":
+        await products_list_callback(update, context)
+
+    elif data == "dashboard":
+        await dashboard_callback(update, context)
+
+    elif data == "admin_reports":
+        await reports_callback(update, context)
+
+    elif data == "admin_alerts":
+        await alerts_callback(update, context)
+
+    elif data == "search":
+        # ConversationHandler هو المسؤول
+        await query.answer()
+
+    elif data == "pharmacy_inventory":
+        await pharmacy_inventory_callback(update, context)
+
+    elif data == "my_pharmacy":
+        await my_pharmacy_callback(update, context)
+
+    elif data == "pharmacy_products":
+        await pharmacy_products_callback(update, context)
+
+    elif data == "pharmacy_low_stock":
+        await pharmacy_low_stock_callback(update, context)
+
+    elif data == "pharmacy_expiry":
+        await pharmacy_expiry_callback(update, context)
+
+    elif data == "pharmacy_update_stock":
+        await pharmacy_update_stock_callback(update, context)
+
+    elif data == "request_visit":
+        await request_visit_callback(update, context)
+
+    elif data == "my_reminders":
+        await my_reminders_callback(update, context)
+
+    elif data == "today_visits":
+        await today_visits_callback(update, context)
+
+    elif data == "export_excel":
+        await export_excel_callback(update, context)
+
+    elif data == "pharmacy_note":
+        await pharmacy_note_callback(update, context)
+
+    else:
+
+        await query.answer(
+            "الخيار غير معروف."
+        )
+
+
+# ============================================================
+# ERROR HANDLER
 # ============================================================
 
 async def error_handler(
@@ -3657,7 +5471,7 @@ async def error_handler(
 
 
 # ============================================================
-# بناء التطبيق
+# MAIN
 # ============================================================
 
 def main():
@@ -3666,94 +5480,80 @@ def main():
 
     seed_specialties()
 
-    application = Application.builder().token(
-        BOT_TOKEN
-    ).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
 
     # ========================================================
     # START
     # ========================================================
 
     application.add_handler(
-
         CommandHandler(
             "start",
             start
         )
-
     )
 
     # ========================================================
-    # إضافة طبيب
+    # DOCTOR CONVERSATION
     # ========================================================
 
     doctor_conversation = ConversationHandler(
 
         entry_points=[
-
             CallbackQueryHandler(
                 add_doctor_start,
                 pattern="^add_doctor$"
             )
-
         ],
 
         states={
 
             ADD_DOCTOR_NAME: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_doctor_name
                 )
-
             ],
 
             ADD_DOCTOR_PHONE: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_doctor_phone
                 )
-
             ],
 
             ADD_DOCTOR_SPECIALTY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_doctor_specialty
                 )
-
             ],
 
             ADD_DOCTOR_CATEGORY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_doctor_category
                 )
-
             ],
 
             ADD_DOCTOR_CITY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_doctor_city
                 )
-
-            ],
+            ]
 
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
             )
-
         ]
 
     )
@@ -3763,67 +5563,55 @@ def main():
     )
 
     # ========================================================
-    # إضافة صيدلية
+    # PHARMACY CONVERSATION
     # ========================================================
 
     pharmacy_conversation = ConversationHandler(
 
         entry_points=[
-
             CallbackQueryHandler(
                 add_pharmacy_start,
                 pattern="^add_pharmacy$"
             )
-
         ],
 
         states={
 
             ADD_PHARMACY_NAME: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_pharmacy_name
                 )
-
             ],
 
             ADD_PHARMACY_OWNER: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_pharmacy_owner
                 )
-
             ],
 
             ADD_PHARMACY_PHONE: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_pharmacy_phone
                 )
-
             ],
 
             ADD_PHARMACY_CITY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_pharmacy_city
                 )
-
             ]
 
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
             )
-
         ]
 
     )
@@ -3833,76 +5621,62 @@ def main():
     )
 
     # ========================================================
-    # إضافة منتج
+    # PRODUCT CONVERSATION
     # ========================================================
 
     product_conversation = ConversationHandler(
 
         entry_points=[
-
             CallbackQueryHandler(
                 add_product_start,
                 pattern="^add_product$"
             )
-
         ],
 
         states={
 
             ADD_PRODUCT_CODE: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_product_code
                 )
-
             ],
 
             ADD_PRODUCT_NAME: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_product_name
                 )
-
             ],
 
             ADD_PRODUCT_SCIENTIFIC: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_product_scientific
                 )
-
             ],
 
             ADD_PRODUCT_CONCENTRATION: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_product_concentration
                 )
-
             ],
 
             ADD_PRODUCT_FORM: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     add_product_form
                 )
-
             ]
 
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
             )
-
         ]
 
     )
@@ -3912,67 +5686,55 @@ def main():
     )
 
     # ========================================================
-    # إضافة مخزون الصيدلية
+    # STOCK CONVERSATION
     # ========================================================
 
     stock_conversation = ConversationHandler(
 
         entry_points=[
-
             CallbackQueryHandler(
                 pharmacy_add_stock_start,
                 pattern="^pharmacy_add_stock$"
             )
-
         ],
 
         states={
 
             ADD_STOCK_PRODUCT: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     pharmacy_add_stock_product
                 )
-
             ],
 
             ADD_STOCK_BATCH: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     pharmacy_add_stock_batch
                 )
-
             ],
 
             ADD_STOCK_QUANTITY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     pharmacy_add_stock_quantity
                 )
-
             ],
 
             ADD_STOCK_EXPIRY: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     pharmacy_add_stock_expiry
                 )
-
             ]
 
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
             )
-
         ]
 
     )
@@ -3982,40 +5744,34 @@ def main():
     )
 
     # ========================================================
-    # البحث
+    # SEARCH CONVERSATION
     # ========================================================
 
     search_conversation = ConversationHandler(
 
         entry_points=[
-
             CallbackQueryHandler(
                 search_start,
                 pattern="^search$"
             )
-
         ],
 
         states={
 
             SEARCH_TEXT: [
-
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND,
                     search_execute
                 )
-
             ]
 
         },
 
         fallbacks=[
-
             CommandHandler(
                 "cancel",
                 cancel
             )
-
         ]
 
     )
@@ -4025,119 +5781,180 @@ def main():
     )
 
     # ========================================================
-    # الأزرار المباشرة
+    # DIRECT CALLBACKS
     # ========================================================
 
     application.add_handler(
-
         CallbackQueryHandler(
             dashboard_callback,
             pattern="^dashboard$"
         )
-
     )
 
     application.add_handler(
-
         CallbackQueryHandler(
-            products_list_callback,
-            pattern="^products_list$"
+            export_excel_callback,
+            pattern="^export_excel$"
         )
-
     )
 
     application.add_handler(
+        CallbackQueryHandler(
+            today_visits_callback,
+            pattern="^today_visits$"
+        )
+    )
 
+    application.add_handler(
+        CallbackQueryHandler(
+            my_reminders_callback,
+            pattern="^my_reminders$"
+        )
+    )
+
+    application.add_handler(
         CallbackQueryHandler(
             pharmacy_inventory_callback,
             pattern="^pharmacy_inventory$"
         )
-
     )
 
     application.add_handler(
+        CallbackQueryHandler(
+            pharmacy_products_callback,
+            pattern="^pharmacy_products$"
+        )
+    )
 
+    application.add_handler(
+        CallbackQueryHandler(
+            pharmacy_low_stock_callback,
+            pattern="^pharmacy_low_stock$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            pharmacy_expiry_callback,
+            pattern="^pharmacy_expiry$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            pharmacy_update_stock_callback,
+            pattern="^pharmacy_update_stock$"
+        )
+    )
+
+    application.add_handler(
         CallbackQueryHandler(
             my_pharmacy_callback,
             pattern="^my_pharmacy$"
         )
-
     )
 
     application.add_handler(
-
         CallbackQueryHandler(
             request_visit_callback,
             pattern="^request_visit$"
         )
-
     )
 
     application.add_handler(
-
-        CallbackQueryHandler(
-            reports_callback,
-            pattern="^admin_reports$"
-        )
-
-    )
-
-    application.add_handler(
-
-        CallbackQueryHandler(
-            alerts_callback,
-            pattern="^admin_alerts$"
-        )
-
-    )
-
-    application.add_handler(
-
         CallbackQueryHandler(
             doctors_list_callback,
             pattern="^(admin_doctors|rep_doctors)$"
         )
-
     )
 
     application.add_handler(
-
         CallbackQueryHandler(
             pharmacies_list_callback,
             pattern="^(admin_pharmacies|rep_pharmacies)$"
         )
+    )
 
+    application.add_handler(
+        CallbackQueryHandler(
+            products_list_callback,
+            pattern="^(admin_products|products_list)$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            pharmacists_list_callback,
+            pattern="^admin_pharmacists$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            hospitals_list_callback,
+            pattern="^admin_hospitals$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            warehouses_list_callback,
+            pattern="^admin_warehouses$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            users_list_callback,
+            pattern="^admin_users$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            reports_callback,
+            pattern="^admin_reports$"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            alerts_callback,
+            pattern="^admin_alerts$"
+        )
     )
 
     # ========================================================
-    # بقية القائمة
+    # GENERAL FALLBACK CALLBACK
     # ========================================================
 
     application.add_handler(
-
         CallbackQueryHandler(
             menu_callback
         )
-
     )
 
-    application.add_handler(
+    # ========================================================
+    # COMMANDS
+    # ========================================================
 
+    application.add_handler(
         CommandHandler(
             "cancel",
             cancel
         )
-
     )
 
     application.add_handler(
-
         CommandHandler(
             "link_pharmacy",
             add_pharmacy_user_command
         )
-
     )
+
+    # ========================================================
+    # ERRORS
+    # ========================================================
 
     application.add_error_handler(
         error_handler
@@ -4153,7 +5970,7 @@ def main():
 
 
 # ============================================================
-# تشغيل البرنامج
+# RUN
 # ============================================================
 
 if __name__ == "__main__":
