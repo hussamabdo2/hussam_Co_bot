@@ -123,6 +123,13 @@ engine = create_engine(
     future=True
 )
 
+from sqlalchemy.orm import sessionmaker
+
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    bind=engine
+)
 
 # ============================================================
 # الثوابت
